@@ -53,7 +53,7 @@ source .venv/bin/activate
 
 ### Verify the installation
 
-After either method, check imports (this does not run checks or GPU kernels):
+After any of these methods, check imports (this does not run checks or GPU kernels):
 
 ```bash
 python -c "import tvm.tirx, tvm_ffi, tirx_kernels.tirx_lite, tirx_harness; print('Core imports OK')"

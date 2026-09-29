@@ -102,9 +102,6 @@ python -m http.server 8018 --bind 127.0.0.1 --directory /path/to/extracted/artif
 
 Open `http://127.0.0.1:8018/docs/`. The artifact root redirects to that path.
 
-After a merge to `main`, the workflow also publishes the website at
-<https://tirxharness.mlc.ai/docs/>.
-
 ## Check external links
 
 External link checking is separate from the HTML build because many source
