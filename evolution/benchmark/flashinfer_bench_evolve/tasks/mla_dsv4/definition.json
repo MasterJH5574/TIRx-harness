@@ -1,0 +1,224 @@
+{
+  "name": "mla_dsv4_sparse_decode_h512",
+  "description": "DeepSeek-V4 sparse MLA decode with the flashinfer.decode.trtllm_batch_decode_sparse_mla_dsv4 contract (flashinfer PR #4573): a single 512-d latent per token serves as key and value (no rope part), varlen query [sum_q, H, 512] with cum_seq_lens_q, two paged latent pools in HND ([pages, 1, page, 512]) or NHD ([pages, page, 1, 512]) layout (SWA pool with 256-token pages, optional compressed pool with 64- or 2-token pages), one combined int32 index table [sum_q, K] whose first 128 columns address the SWA pool (causal window of the last 128 positions, valid entries first, -1 padded) and whose remaining columns address the compressed pool, per-token active lengths sparse_topk_lens (counting the 128 SWA slots), per-request KV lengths, an fp32 attention-sink logit per head, bmm1_scale = 512**-0.55 and bmm2_scale = 1. Query and pools are bf16 or per-tensor float8_e4m3fn (kv_dtype); the output is bf16. Workloads are the PR's 94 rows: 84 decode rows (B=3, q_lens [3, 4, 5], two sequence-length cases, swa128 / swa128+topk4x / swa128+topk128x, H in {8, 16, 32, 64, 128}, both dtypes, both layouts), two guard rows (q 64 of kv 128; B=2 dense query [2, 5, H, 512] without cum_seq_lens_q) and eight prefill-style rows (B=2, q_lens [129, 257], 4K and 16K KV, swa128+topk4x, both dtypes).",
+  "op_type": "attention",
+  "tags": [
+    "status:synthetic",
+    "stage:decode",
+    "dtype:bfloat16",
+    "dtype:float8_e4m3fn",
+    "model:deepseek-v4",
+    "layout:paged-hnd",
+    "layout:paged-nhd",
+    "kernel:trtllm-gen-sparse-mla-dsv4"
+  ],
+  "axes": {
+    "num_heads": {
+      "type": "var",
+      "description": "Query heads (H); one latent KV head."
+    },
+    "num_seqs": {
+      "type": "var",
+      "description": "Requests per call (B): 3 on decode rows, 1 / 2 on the guard rows, 2 on prefill-style rows."
+    },
+    "sum_q": {
+      "type": "var",
+      "description": "Query tokens; varlen rows: q_lens = round(linspace(ceil(max_q_len / 2), max_q_len, B)); dense row: num_seqs * max_q_len."
+    },
+    "max_q_len": {
+      "type": "var",
+      "description": "Longest per-request query length (5 decode, 128 seq_lens guard, 257 prefill-style)."
+    },
+    "cum_seq_lens_len": {
+      "type": "var",
+      "description": "B + 1 on varlen rows; 0 on the dense row (cum_seq_lens_q is None)."
+    },
+    "head_dim": {
+      "type": "const",
+      "value": 512,
+      "description": "Latent (K and V) dimension."
+    },
+    "swa_page_size": {
+      "type": "const",
+      "value": 256,
+      "description": "Tokens per SWA pool page."
+    },
+    "swa_seq_len": {
+      "type": "var",
+      "description": "KV length of request 0; request b has swa_seq_len + 256 * b."
+    },
+    "num_swa_pages": {
+      "type": "var",
+      "description": "Pages in the SWA pool (B * pages of the longest request)."
+    },
+    "swa_pool_dim1": {
+      "type": "var",
+      "description": "Second dim of swa_kv_cache: 1 for HND, swa_page_size for NHD."
+    },
+    "swa_pool_dim2": {
+      "type": "var",
+      "description": "Third dim of swa_kv_cache: swa_page_size for HND, 1 for NHD."
+    },
+    "compressed_page_size": {
+      "type": "var",
+      "description": "Tokens per compressed pool page (64 or 2); 0 when the pool is absent."
+    },
+    "compressed_seq_len": {
+      "type": "var",
+      "description": "Base compressed length; request b has max(base, compressed_topk, max_q_len) + page_size * b."
+    },
+    "num_compressed_pages": {
+      "type": "var",
+      "description": "Pages in the compressed pool; 0 when absent."
+    },
+    "compressed_pool_dim1": {
+      "type": "var",
+      "description": "Second dim of compressed_kv_cache: 1 for HND, compressed_page_size for NHD; 0 when absent."
+    },
+    "compressed_pool_dim2": {
+      "type": "var",
+      "description": "Third dim of compressed_kv_cache: compressed_page_size for HND, 1 for NHD; 0 when absent."
+    },
+    "compressed_topk": {
+      "type": "var",
+      "description": "Compressed index columns per token (K - 128)."
+    },
+    "sparse_topk": {
+      "type": "var",
+      "description": "Index columns per token (K): 128 SWA slots plus compressed_topk."
+    },
+    "kv_dtype": {
+      "type": "var",
+      "description": "Dtype of query and both pools: bfloat16 or float8_e4m3fn (per-tensor FP8, scales 1)."
+    },
+    "kv_layout": {
+      "type": "var",
+      "description": "Pool layout: HND [pages, 1, page, 512] or NHD [pages, page, 1, 512] (identical bytes for one KV head)."
+    },
+    "query_layout": {
+      "type": "var",
+      "description": "'varlen': query [sum_q, H, 512] with cum_seq_lens_q; 'dense': query [num_seqs, max_q_len, H, 512], cum_seq_lens_q and max_q_len None (upstream's dense-q guard row)."
+    }
+  },
+  "constraints": [
+    "num_heads in (8, 16, 32, 64, 128)",
+    "sparse_topk >= 128 and sparse_topk % 4 == 0",
+    "128 <= sparse_topk_lens[t] <= sparse_topk",
+    "seq_lens[b] >= cum_seq_lens_q[b + 1] - cum_seq_lens_q[b]",
+    "compressed_page_size == 0 implies compressed_kv_cache is None and sparse_topk == 128",
+    "query.dtype == swa_kv_cache.dtype == compressed_kv_cache.dtype == kv_dtype in (torch.bfloat16, torch.float8_e4m3fn)",
+    "kv_layout == 'HND' implies pools are [pages, 1, page_size, 512]; 'NHD' implies [pages, page_size, 1, 512]",
+    "query_layout == 'dense' implies cum_seq_lens_q is None, max_q_len is None and query is [num_seqs, max_q_len, H, 512]"
+  ],
+  "inputs": {
+    "query": {
+      "shape": [
+        "sum_q",
+        "num_heads",
+        "head_dim"
+      ],
+      "dense_shape": [
+        "num_seqs",
+        "max_q_len",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16 | float8_e4m3fn",
+      "description": "Queries in kv_dtype: packed varlen [sum_q, H, 512] (shape), or [num_seqs, max_q_len, H, 512] (dense_shape) when query_layout is 'dense'."
+    },
+    "swa_kv_cache": {
+      "shape": [
+        "num_swa_pages",
+        "swa_pool_dim1",
+        "swa_pool_dim2",
+        "head_dim"
+      ],
+      "dtype": "bfloat16 | float8_e4m3fn",
+      "description": "Paged SWA latent pool in kv_layout ([pages, 1, 256, 512] HND, [pages, 256, 1, 512] NHD); flat row = page * 256 + offset."
+    },
+    "compressed_kv_cache": {
+      "shape": [
+        "num_compressed_pages",
+        "compressed_pool_dim1",
+        "compressed_pool_dim2",
+        "head_dim"
+      ],
+      "dtype": "bfloat16 | float8_e4m3fn",
+      "description": "Paged compressed latent pool in kv_layout ([pages, 1, page, 512] HND, [pages, page, 1, 512] NHD); None on swa128 rows."
+    },
+    "sparse_indices": {
+      "shape": [
+        "sum_q",
+        "sparse_topk"
+      ],
+      "dtype": "int32",
+      "description": "Flat row indices: columns 0..127 into the SWA pool (valid first, -1 padded), 128.. into the compressed pool; -1 invalid."
+    },
+    "sparse_topk_lens": {
+      "shape": [
+        "sum_q"
+      ],
+      "dtype": "int32",
+      "description": "Active columns per token, including the 128 SWA slots."
+    },
+    "seq_lens": {
+      "shape": [
+        "num_seqs"
+      ],
+      "dtype": "int32",
+      "description": "KV length per request (>= its query length)."
+    },
+    "cum_seq_lens_q": {
+      "shape": [
+        "cum_seq_lens_len"
+      ],
+      "dtype": "int32",
+      "description": "Packed query offsets; None on the dense row."
+    },
+    "max_q_len": {
+      "shape": null,
+      "dtype": "int32",
+      "description": "Longest query length in the batch; None on the dense row."
+    },
+    "sinks": {
+      "shape": [
+        "num_heads"
+      ],
+      "dtype": "float32",
+      "description": "Attention-sink logit per head."
+    },
+    "bmm1_scale": {
+      "shape": null,
+      "dtype": "float32",
+      "description": "QK^T softmax scale, 512**-0.55."
+    },
+    "bmm2_scale": {
+      "shape": null,
+      "dtype": "float32",
+      "description": "PV output scale, 1.0."
+    },
+    "kv_layout": {
+      "shape": null,
+      "dtype": "str",
+      "description": "'HND' or 'NHD', the pools' layout."
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "sum_q",
+        "num_heads",
+        "head_dim"
+      ],
+      "dense_shape": [
+        "num_seqs",
+        "max_q_len",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "bf16 attention output in the query's shape: [sum_q, H, 512], or dense_shape on the dense row (also on fp8 rows)."
+    }
+  },
+  "reference": "import torch\n\n\n@torch.no_grad()\ndef run(\n    query: torch.Tensor,\n    swa_kv_cache: torch.Tensor,\n    compressed_kv_cache,\n    sparse_indices: torch.Tensor,\n    sparse_topk_lens: torch.Tensor,\n    seq_lens: torch.Tensor,\n    cum_seq_lens_q: torch.Tensor,\n    max_q_len: int,\n    sinks,\n    bmm1_scale: float,\n    bmm2_scale: float,\n    kv_layout: str = \"HND\",\n):\n    \"\"\"\n    DeepSeek-V4 sparse MLA decode (flashinfer.decode.\n    trtllm_batch_decode_sparse_mla_dsv4 semantics) in fp32:\n\n    \u2022 query and both pools are bf16 or per-tensor float8_e4m3fn (read exactly,\n      no extra scaling); kv_layout only names the pools' layout ([pages, 1, page,\n      512] HND or [pages, page, 1, 512] NHD hold identical bytes for one KV head).\n\n    \u2022 one 512-d latent row serves as key and value; query is varlen\n      [sum_q, H, 512] (cum_seq_lens_q / max_q_len only describe the packing) or,\n      when cum_seq_lens_q is None, dense [B, max_q_len, H, 512] (flattened here;\n      the output keeps the query's shape).\n    \u2022 sparse_indices [sum_q, K] holds flat token-row indices\n      (page * page_size + offset): columns 0..127 into swa_kv_cache\n      [num_swa_pages, 1, 256, 512], columns 128..K-1 into compressed_kv_cache\n      [num_compressed_pages, 1, page_size, 512]; -1 marks an invalid slot.\n    \u2022 a slot is active when its index is >= 0 and its column is below\n      sparse_topk_lens[t] (which counts the 128 SWA slots).\n    \u2022 per token t and head h: scores = bmm1_scale * q[t, h] . row over the\n      active slots, softmax with the extra logit sinks[h] (i.e. the row\n      probabilities are divided by 1 + exp(sinks[h] - lse)), and\n      out[t, h] = bmm2_scale * sum probs * rows; a token with no active\n      slot outputs zeros. The result is bf16.\n    \u2022 seq_lens [B] carries the KV length per request for the kernel's SWA\n      window bookkeeping; the index tensor already encodes that window.\n    \"\"\"\n\n    query_shape = query.shape\n    if query.dim() == 4:  # dense [B, max_q_len, H, 512]: same math, flattened\n        query = query.reshape(-1, query.shape[2], query.shape[3])\n    sum_q, num_heads, head_dim = query.shape\n    indices = sparse_indices.to(torch.int64)\n    topk = indices.shape[1]\n    columns = torch.arange(topk, device=query.device)\n    active = (indices >= 0) & (columns[None, :] < sparse_topk_lens.to(torch.int64)[:, None])\n\n    swa_rows = swa_kv_cache.reshape(-1, head_dim).float()\n    rows = swa_rows[indices[:, :128].clamp_min(0)]  # [sum_q, 128, 512]\n    if topk > 128:\n        compressed_rows = compressed_kv_cache.reshape(-1, head_dim).float()\n        rows = torch.cat([rows, compressed_rows[indices[:, 128:].clamp_min(0)]], dim=1)\n\n    scores = torch.einsum(\"thd,tkd->thk\", query.float(), rows) * float(bmm1_scale)\n    scores = scores.masked_fill(~active[:, None, :], float(\"-inf\"))\n    lse = torch.logsumexp(scores, dim=-1)  # [sum_q, H]; -inf without active slots\n    probs = torch.exp(scores - lse[..., None])\n    probs = torch.where(active[:, None, :], probs, torch.zeros_like(probs))\n    if sinks is not None:\n        probs = probs / (1.0 + torch.exp(sinks.float()[None, :] - lse))[..., None]\n    out = torch.einsum(\"thk,tkd->thd\", probs, rows) * float(bmm2_scale)\n    return out.to(torch.bfloat16).reshape(query_shape)\n"
+}

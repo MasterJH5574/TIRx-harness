@@ -1,0 +1,28 @@
+{
+  "name": "fp16_gemm_floor",
+  "description": "FP16 GEMM benchmark over square, LLM projection, and mixed-aspect-ratio shapes.",
+  "op_type": "gemm",
+  "tags": [
+    "dtype:fp16",
+    "status:synthetic",
+    "baseline:cublas"
+  ],
+  "axes": {
+    "M": {"type": "var"},
+    "N": {"type": "var"},
+    "K": {"type": "var"}
+  },
+  "constraints": [
+    "A.shape == [M, K]",
+    "B.shape == [N, K]",
+    "A.dtype == B.dtype == torch.float16"
+  ],
+  "inputs": {
+    "A": {"shape": ["M", "K"], "dtype": "float16"},
+    "B": {"shape": ["N", "K"], "dtype": "float16"}
+  },
+  "outputs": {
+    "D": {"shape": ["M", "N"], "dtype": "float16"}
+  },
+  "reference": "from flashinfer_bench_evolve.tasks.fp16_gemm_floor.baseline import run\n"
+}

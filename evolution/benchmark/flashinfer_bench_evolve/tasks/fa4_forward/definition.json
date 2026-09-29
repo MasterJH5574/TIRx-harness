@@ -1,0 +1,82 @@
+{
+  "name": "fa4_forward_fp16",
+  "description": "FlashAttention-4 style fp16 attention forward benchmark with deterministic synthetic large-sequence inputs.",
+  "op_type": "flash_attention",
+  "tags": [
+    "stage:forward",
+    "dtype:fp16",
+    "status:synthetic",
+    "kernel:fa4"
+  ],
+  "axes": {
+    "batch_size": {
+      "type": "var"
+    },
+    "seq_len": {
+      "type": "var"
+    },
+    "num_heads": {
+      "type": "var"
+    },
+    "head_dim": {
+      "type": "const",
+      "value": 128
+    },
+    "causal": {
+      "type": "var"
+    }
+  },
+  "constraints": [
+    "q.shape == k.shape == v.shape",
+    "q.dtype == torch.float16"
+  ],
+  "inputs": {
+    "q": {
+      "shape": [
+        "batch_size",
+        "seq_len",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "float16"
+    },
+    "k": {
+      "shape": [
+        "batch_size",
+        "seq_len",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "float16"
+    },
+    "v": {
+      "shape": [
+        "batch_size",
+        "seq_len",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "float16"
+    },
+    "causal": {
+      "shape": null,
+      "dtype": "bool"
+    },
+    "sm_scale": {
+      "shape": null,
+      "dtype": "float32"
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "batch_size",
+        "seq_len",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "float16"
+    }
+  },
+  "reference": "#!/usr/bin/env python3\n\"\"\"flash-attn baseline for fp16 FA4 forward.\"\"\"\n\nfrom __future__ import annotations\n\nimport torch\nfrom flash_attn import flash_attn_func\n\n\n@torch.no_grad()\ndef run(q, k, v, causal, sm_scale):\n    return flash_attn_func(\n        q,\n        k,\n        v,\n        dropout_p=0.0,\n        softmax_scale=float(sm_scale),\n        causal=bool(causal),\n    )\n"
+}

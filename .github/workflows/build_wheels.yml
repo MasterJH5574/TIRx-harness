@@ -1,0 +1,135 @@
+name: Build wheels
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v[0-9]*']
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Optional tag, branch, or SHA; defaults to the caller ref'
+        type: string
+        required: false
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Optional tag, branch, or SHA; defaults to the selected workflow ref'
+        type: string
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  sdist:
+    name: Source distribution
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - name: Fetch pinned native build sources
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          revision=$(git rev-parse HEAD:thirdparty/tvm-rust-ext)
+          archive="$RUNNER_TEMP/tvm-rust-ext-${revision}.tar.gz"
+          gh release download v0.1.0rc0 --pattern "tvm-rust-ext-${revision}.tar.gz" --dir "$RUNNER_TEMP"
+          echo "aef27d878f9c8510ec0070a8e5a42aa2f3c09ed8363b4449be4988bc3e4b9dd9  $archive" | sha256sum --check
+          source=tirx_harness/frontend-rs/thirdparty/tvm-rust-ext
+          mkdir -p "$source"
+          tar -xzf "$archive" -C "$source"
+          printf '%s\n' "$revision" > "$source/REVISION"
+      - name: Build and check the source distribution
+        run: |
+          uv build --sdist --out-dir dist .
+          uv tool run twine check --strict dist/*
+      - name: Check the tag-derived release version
+        env:
+          BUILD_REF: ${{ inputs.ref || github.ref }}
+        run: |
+          python - <<'PY'
+          import email
+          import os
+          import pathlib
+          import tarfile
+
+          with tarfile.open(next(pathlib.Path('dist').glob('*.tar.gz'))) as archive:
+              info = next(member for member in archive.getmembers()
+                          if member.name.endswith('/PKG-INFO') and member.name.count('/') == 1)
+              version = email.message_from_binary_file(archive.extractfile(info))['Version']
+          ref = os.environ['BUILD_REF']
+          if ref.startswith('refs/tags/'):
+              assert ref == f'refs/tags/v{version}', (ref, version)
+          print(f'Built tirx-harness {version}')
+          PY
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tirx-harness-sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  build:
+    name: Linux ${{ matrix.arch }}
+    needs: sdist
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: ubuntu-24.04, arch: x86_64}
+          - {os: ubuntu-24.04-arm, arch: aarch64}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: tirx-harness-sdist
+          path: dist
+      - name: Unpack the standalone source distribution
+        run: |
+          mkdir -p source
+          tar -xzf dist/*.tar.gz -C source --strip-components=1
+      - name: Build and test manylinux wheels from the source distribution
+        uses: pypa/cibuildwheel@294735312765b09d24a2fbec22660ce817587d55 # v4.1.0
+        env:
+          # One abi3 wheel per architecture, tested on both supported Python versions.
+          CIBW_BUILD: cp31{2,3}-manylinux_${{ matrix.arch }}
+          CIBW_ARCHS_LINUX: ${{ matrix.arch }}
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
+          CIBW_MANYLINUX_AARCH64_IMAGE: manylinux_2_28
+          CIBW_BEFORE_ALL_LINUX: >-
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh &&
+            sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain 1.89.0
+          CIBW_ENVIRONMENT_LINUX: 'PATH="$HOME/.cargo/bin:$PATH" CARGO_BUILD_JOBS="2"'
+          # tvm_ffi loads its own globally visible library before the frontend.
+          # Bundling another copy would split TVM's process-global type registry.
+          CIBW_REPAIR_WHEEL_COMMAND_LINUX: >-
+            auditwheel repair --exclude libtvm_ffi.so -w {dest_dir} {wheel}
+          CIBW_TEST_COMMAND: python {project}/scripts/smoke_wheel.py
+        with:
+          package-dir: source
+          output-dir: wheelhouse
+      - name: Check wheel metadata
+        run: uv tool run twine check --strict wheelhouse/*.whl
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tirx-harness-wheels-linux-${{ matrix.arch }}
+          path: wheelhouse/*.whl
+          if-no-files-found: error

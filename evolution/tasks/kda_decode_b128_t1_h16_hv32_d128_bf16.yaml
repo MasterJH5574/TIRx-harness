@@ -1,0 +1,58 @@
+name: kda_decode_b128_t1_h16_hv32_d128_bf16
+workload_dir: candidates/kda/decode_b128_t1_h16_hv32_d128_bf16
+kernel_authoring: tirx-lite
+sota_baseline:
+  name: recurrent_kda_cutedsl
+bench_timeout_s: 300
+banned_paths:
+  - tirx-kernels/tirx_kernels/kda/**
+  - tirx-kernels/tirx_kernels/ported/flashinfer/kda/**
+  - tirx-kernels/.agents/sketch/flashinfer/kda/**
+spec: |
+  Implement recurrent Kimi Delta Attention decode on B200 (sm_100) and beat
+  flashinfer.kda_decode.recurrent_kda's CuTe-DSL route.
+
+  This fixed-shape task pins the following large-batch official row:
+  `kda-decode-d128-t1-b128-h16-hv32-standard_decode-precomputed`.
+  This is standard decode with N=B=128, T=L=1, H=16, HV=32 and K=V=128.
+  It uses the largest official batch for standard single-token decode and
+  one state slot per sequence. All sequences use the same dense layout.
+  The T=6 speculative row also has uniform lengths and contiguous checkpoint
+  indices. It adds per-token state checkpoints and acceptance semantics;
+  this task deliberately targets the standard-decode contract, rather than
+  treating speculative decode as a larger shape of that same contract.
+
+  Inputs, in order, are q, k, v, g, beta, A_log, dt_bias, scale,
+  initial_state, cu_seqlens, ssm_state_indices, num_spec_tokens,
+  num_accepted_tokens, lower_bound. q/k are bf16[B,L,H,128], v/g are
+  bf16[B,L,HV,128], and beta is bf16[B,L,HV], already sigmoid-activated.
+  initial_state is a bf16[P,HV,V,K] pool in V-first layout. scale is fp32.
+  P=128. A_log, dt_bias, cu_seqlens, ssm_state_indices, num_spec_tokens,
+  num_accepted_tokens and lower_bound are all None.
+
+  Normalize q/k as x/sqrt(sum(x*x)+1e-6); value head hv uses q/k head
+  hv//2. Gates are precomputed, so decay=exp(g).
+  With a conceptual K-first state S, each token computes
+    S_decay = S * decay[:,None]
+    S = S_decay + beta * outer(k, v - k @ S_decay)
+    output = scale * q @ S.
+
+  Sequence n reads initial_state[n] and writes its updated state to
+  final_state[n]. Return output bf16[128,1,32,128] and a new final_state
+  bf16[128,32,128,128]. Never mutate initial_state or cross sequences.
+
+  Version contract: solution.py exports setup(data, N, T) -> callable. data
+  contains all fourteen inputs and preallocated output/final_state. setup
+  may compile, allocate scratch, and execute one warmup call. Each timed
+  call must recompute normalization, gating and recurrence from initial_state
+  and overwrite output and every final_state slot. Do not call FlashInfer,
+  PyTorch tensor operators, Triton, CUTE DSL, raw CUDA, or existing solutions
+  for production computation.
+
+  Correctness compares output and the complete final_state pool to the
+  explicit CuTe-DSL reference. Both sides are cast to fp32, and every element
+  must satisfy abs(candidate-ref)<=0.01+0.01*abs(ref). RMS is diagnostic only.
+  Repeated numerical checks and output poisoning
+  remain enabled.
+  The adapter scores only the selected official row. Scoring is baseline
+  latency / candidate latency.

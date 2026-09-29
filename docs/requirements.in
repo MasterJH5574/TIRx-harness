@@ -1,0 +1,6 @@
+# Documentation uses Python 3.12 and does not install the kernel runtime.
+Sphinx==9.1.0
+myst-parser==5.1.0
+furo==2025.12.19
+sphinx-copybutton==0.5.2
+sphinx-design==0.7.0

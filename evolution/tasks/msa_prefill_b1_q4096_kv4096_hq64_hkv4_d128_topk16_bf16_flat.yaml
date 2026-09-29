@@ -1,0 +1,51 @@
+name: msa_prefill_b1_q4096_kv4096_hq64_hkv4_d128_topk16_bf16_flat
+workload_dir: candidates/msa/prefill_b1_q4096_kv4096_hq64_hkv4_d128_topk16_bf16_flat
+kernel_authoring: tirx-lite
+sota_baseline:
+  name: minimax_sparse_atten_func
+bench_timeout_s: 300
+banned_paths:
+  - tirx-kernels/tirx_kernels/msa/**
+  - tirx-kernels/tirx_kernels/ported/msa/**
+  - tirx-kernels/.agents/sketch/msa/**
+spec: |
+  Implement MiniMax sparse attention prefill on B200 (sm_100) with the
+  msa_sparse_attention contract. Beat the packaged baseline:
+  MiniMax fmha_sm100 sparse_atten_func.
+
+  This fixed-shape task pins the following large official row:
+  `prefill_bf16_b1_q4096_kv4096_h64`.
+  B=1, Q=KV=4096, Hq=64, Hkv=4, D=128, topk=16, and bf16 q/K/V.
+  K/V are flat and the one sequence fills 32 complete 128-token blocks.
+  cu_seqlens_q=cu_seqlens_k=[0,4096], page_table=seqused_k=None.
+  The 4096-token, 64-query-head shape uses GQA=16 and one storage dtype.
+
+  Inputs, in order, are q, k, v, q2k_indices, cu_seqlens_q, cu_seqlens_k,
+  page_table, seqused_k, softmax_scale. q is contiguous bf16[4096,64,128].
+  K/V have shape bf16[4096,4,128].
+  Output has q's shape and dtype, and inputs must remain unchanged.
+  q2k_indices is int32[Hkv,Q,topk]: ascending sequence-local KV block ids,
+  padded with -1. cu_seqlens_q and cu_seqlens_k are int32[2]; page_table
+  and seqused_k are None. softmax_scale is fp32, officially 1/sqrt(128).
+
+  Query head h uses KV head h//(Hq/Hkv). Token i of sequence b may attend
+  only selected blocks' valid tokens at positions <= kv_len[b]-q_len[b]+i
+  (bottom-right causal masking). Compute softmax(softmax_scale*q@k.T)@v
+  over those tokens. An empty selection returns zeros. Tokens beyond the
+  causal boundary and -1 padding must never contribute.
+
+  Version contract: solution.py exports setup(data, total_q, B) -> callable.
+  data contains the nine inputs above and preallocated output. setup may
+  compile, allocate scratch and shape-only metadata, and execute one warmup
+  call. Each timed call must consume current selection/length/page metadata,
+  perform data-dependent preparation, and overwrite output. The adapter
+  returns (data['output'],). Do not call FlashInfer, MiniMax MSA, PyTorch
+  tensor operators, Triton, CUTE DSL, raw CUDA, or existing solution kernels
+  for production computation.
+
+  Correctness uses an independent sparse-attention oracle with bf16 output.
+  Every element must pass PyTorch's additive atol+rtol*abs(reference)
+  criterion with atol=rtol=0.01 in the native bf16 dtype. RMS is diagnostic
+  only. Repeated numerical checks and output poisoning
+  remain enabled. The adapter scores only the selected official
+  row. Scoring is packaged baseline latency / candidate latency.

@@ -1,0 +1,76 @@
+name: mla_dsv4_prefill_b2_qsum386_qmax257_h128_d512_swa16384_c16384_topk1152_bf16_hnd_varlen
+workload_dir: candidates/mla_dsv4_prefill_b2_qsum386_qmax257_h128_d512_swa16384_c16384_topk1152_bf16_hnd_varlen
+kernel_authoring: tirx-lite
+sota_baseline:
+  name: trtllm_batch_decode_sparse_mla_dsv4
+bench_timeout_s: 300
+banned_paths: []
+spec: |
+  Implement DeepSeek-V4 sparse MLA prefill on B200 (sm_100) and beat the
+  packaged flashinfer.decode.trtllm_batch_decode_sparse_mla_dsv4 baseline
+  with PDL disabled.
+
+  This task pins the large official row
+  `mla-dsv4-prefill-h128-swa16384-topk4x-c16384-k1024-bf16-hnd`.
+  B=2, Q=386 total query tokens, H=128, D=512, and K=1152 sparse slots:
+  128 SWA slots plus 1024 compressed slots. Query lengths are [129,257],
+  cum_seq_lens_q=[0,129,386], and max_q_len=257. The name's qsum and qmax
+  denote total and maximum per-request query lengths. This is explicitly
+  a varlen prefill task; the requests do not have equal Q or KV lengths.
+
+  SWA KV lengths are [16384,16640], with page size 256 and 64/65 logical
+  pages per request. Compressed KV lengths are [16384,16448], with page
+  size 64 and 256/257 logical pages. Both pools use complete logical pages,
+  bf16 values and HND storage. The physical allocations contain 130 SWA
+  pages and 514 compressed pages. The swa16384/c16384 suffixes give the
+  pools' base sequence lengths, not every request's length.
+
+  Inputs, in order:
+    query: contiguous bf16[386,128,512];
+    swa_kv_cache: contiguous bf16[130,1,256,512];
+    compressed_kv_cache: contiguous bf16[514,1,64,512];
+    sparse_indices: int32[386,1152];
+    sparse_topk_lens: int32[386];
+    seq_lens: int32[2], containing the SWA KV lengths;
+    cum_seq_lens_q: int32[3];
+    max_q_len: integer scalar 257;
+    sinks: fp32[128];
+    bmm1_scale: fp32 scalar, officially 512**-0.55;
+    bmm2_scale: fp32 scalar, officially 1.0;
+    kv_layout: string 'HND'.
+  Output is bf16[386,128,512]. A single 512-dimensional latent serves as
+  both key and value. Inputs must remain unchanged.
+  Query, KV noise and sink random amplitudes are 0.05. SWA/compressed KV
+  values add offsets -0.20/+0.25 and are clamped to [-1,1].
+
+  Columns 0..127 of sparse_indices address flattened SWA token rows;
+  columns 128..1151 address flattened compressed rows. A flattened index
+  maps to page=index//page_size and offset=index%page_size within its pool.
+  A slot participates only if its index is nonnegative and its column is
+  below sparse_topk_lens[t], which includes the 128 SWA slots. The index
+  table already encodes each request's SWA window; -1 denotes padding.
+  Physical pages are permuted and compressed indices are sampled per query.
+  The published input builder decreases active sparse lengths by one per
+  query: 1152 down to 1024 for the first request, and 1088 down to 832 for
+  the second. Consume the supplied indices and lengths at runtime.
+
+  For each token/head, score_j=bmm1_scale*dot(query,latent_j). Normalize
+  exp(score_j) by sum_j exp(score_j)+exp(sinks[h]); the sink contributes no
+  value. Return bmm2_scale times the probability-weighted latent sum,
+  cast to bf16. No active slots means zeros.
+
+  Version contract: solution.py exports setup(data, Q, K) -> callable, with
+  Q=386 and K=1152. data contains all twelve inputs and preallocated output.
+  setup may compile, allocate scratch, and execute one warmup call. Every
+  timed invocation must consume current indices, lengths, pools and sinks,
+  perform any data-dependent preparation, and overwrite output. The adapter
+  returns (data['output'],). Do not call FlashInfer, PyTorch tensor operators,
+  Triton, CUTE DSL, raw CUDA, or existing solutions for production computation.
+
+  Correctness uses the independent fp32 sparse-attention oracle's bf16
+  output. Both outputs are cast to fp32, and every element must satisfy
+  abs(candidate-ref)<=8e-4+2e-2*abs(ref). RMS is diagnostic only.
+  Repeated checks and output poisoning
+  remain enabled. The adapter scores only the selected official row, keeping
+  its original published seed. Scoring is baseline latency / candidate latency,
+  higher is better.

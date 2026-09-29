@@ -1,0 +1,69 @@
+name: gdn_prefill_native
+# Native-language variant of gdn_prefill: same benchmark and task math, but
+# implementation must not use tirx-lite/TIRx.
+workload_dir: candidates/gdn/prefill
+kernel_authoring: task
+sota_baseline:
+  name: flashinfer_chunk_gated_delta_rule
+bench_timeout_s: 120
+banned_paths:
+  - tirx-kernels/tirx_kernels/ported/flashinfer/gdn_prefill/**
+  - tirx-kernels/.agents/sketch/flashinfer/gdn_prefill/**
+spec: |
+  Implement Gated Delta Net (Qwen3-Next) PREFILL on B200 (sm_100) and beat
+  `flashinfer.chunk_gated_delta_rule` on kernel-only latency.
+
+  Algorithm: the CHUNKWISE gated delta rule over packed varlen sequences.
+  Each sequence is split into blocks of B tokens; a recurrent state H[V, K]
+  per (seq, value-head) is carried across blocks — within a block, outputs
+  combine an intra-block causal contribution (WY-form construction) with the
+  carried inter-block state, then the state is updated once per block. Gate
+  inputs are consumed as g = -exp(A_log) * softplus(fp32(a) + dt_bias) and
+  beta = sigmoid(fp32(b)), per token and value-head.
+  For each sequence and value head h (query/key head h//2), carry state
+  H[V,K] across implementation-chosen token blocks. Within one block, define
+  g_i=-exp(A_log[h])*softplus(fp32(a_i)+dt_bias[h]), beta_i=sigmoid(fp32(b_i)),
+  G_i=sum_{r<=i}g_r, and strictly lower-triangular
+  R_ij=beta_i*dot(k_i,k_j)*exp(G_i-G_j) for i>j. Let A=(I+R)^-1,
+  U=A@(beta*v), and W=A@(beta*exp(G)*k). Then
+    vnew_i = U_i - H @ W_i
+    output_i = bf16(scale * (exp(G_i)*(H@q_i)
+                 + sum_{j<=i} dot(q_i,k_j)*exp(G_i-G_j)*vnew_j))
+  and after the block
+    H = exp(G_last)*H
+        + sum_j exp(G_last-G_j)*outer(vnew_j,k_j).
+  Publish the final H for each sequence/head. This blockwise recurrence is
+  the immutable math contract; block size and schedule are implementation
+  choices.
+
+  Shapes (run() contract): q,k bf16[total_T, HQK=4, K=128]; v bf16[total_T,
+  HV=8, V=128] (grouped, G = HV/HQK = 2); state fp32[num_seqs, HV, V, K];
+  gates A_log fp32[HV], a,b bf16[total_T, HV], dt_bias fp32[HV];
+  cu_seqlens int64[num_seqs+1]. Outputs: output bf16[total_T, HV, V],
+  new_state fp32[num_seqs, HV, V, K]. Official varlen-packed traces span
+  total_T=6-8192 and num_seqs=1-57; synthetic stress rows add
+  (total_T, num_seqs)=(16384,64) and (32768,128).
+  The kernel must respect cu_seqlens boundaries.
+
+  Correctness: atol=0.01, rtol=0.01, matched_ratio=1.0 (adapter.py checks this).
+  The adapter scores all official trace workloads and both synthetic stress rows.
+
+  IMPLEMENTATION LANGUAGE: any GPU kernel language or stack available in this
+  environment EXCEPT tirx-lite and its underlying TVM/TIRx stack — e.g. CUDA C++
+  (with CUTLASS/CuTe headers or inline PTX), the CuTe-DSL Python package, or
+  Triton. Use tensor cores (tcgen05 MMA) and TMA whenever possible through your
+  chosen stack.
+
+  OWN-SOURCE RULE (invalidates the run if broken): every GPU kernel that
+  `setup()`/`kernel_fn()` launches must be compiled from source that lives in
+  this run's `v<N>/` directories and was written in this run. Invoking a
+  prebuilt implementation of this operator or its stages — flashinfer,
+  fla/flash-linear-attention, vLLM/SGLang kernels, cuBLAS/cuDNN ops, torch
+  composite ops on the data path — is not a valid implementation: the bench
+  would then score the library, not this run's kernel. Host-side glue outside
+  the timed path (tensor allocation, nvcc/nvrtc/Triton compilation, launch
+  plumbing) is fine.
+
+  Required schedule structure: implement this as a persistent kernel with an
+  in-kernel tile scheduler loop, not a runtime-scheduled grid with one CTA per
+  chunk/tile as the primary execution structure.

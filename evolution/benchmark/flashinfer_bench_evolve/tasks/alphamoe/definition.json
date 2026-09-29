@@ -1,0 +1,149 @@
+{
+  "name": "alphamoe_fp8_block_scale_moe_bf16",
+  "description": "AlphaMoE FP8 expert operator at the BF16/preselected-route boundary: BF16 activations, int32 top-k IDs and original FP32 route weights, FP8 expert weights with 128x128 scales. Input quantization uses PR #4287's eager Torch group-128 recipe, independently reproduced by the correctness oracle. Input quantization, routing, expert computation and output reduction are timed; router softmax/top-k and offline weight conversion are outside this operator. TRT-LLM is the performance baseline. The task evaluates complete routes into a zero-initialized BF16 output; the PR API's partial routing plans and caller-owned accumulator are outside this task boundary.",
+  "op_type": "moe",
+  "tags": [
+    "status:synthetic",
+    "model:qwen3-next",
+    "model:deepseek-r1",
+    "quantization:float8_e4m3fn",
+    "inputs:preselected-topk",
+    "kernel:alphamoe"
+  ],
+  "axes": {
+    "num_tokens": {
+      "type": "var",
+      "description": "Number of tokens (M)."
+    },
+    "hidden_size": {
+      "type": "var",
+      "description": "Hidden dimension (K), multiple of 128."
+    },
+    "intermediate_size": {
+      "type": "var",
+      "description": "Per-rank expert intermediate size (N/2), multiple of 128."
+    },
+    "gemm1_out_size": {
+      "type": "var",
+      "description": "Gate+up rows, N = 2 * intermediate_size."
+    },
+    "num_experts": {
+      "type": "var",
+      "description": "Local expert count (E), fused shared experts included."
+    },
+    "num_shared_experts": {
+      "type": "var",
+      "description": "Fused shared experts in the last expert slots, present in every token's trailing routes."
+    },
+    "top_k": {
+      "type": "var",
+      "description": "Preselected routes per token, shared experts included."
+    },
+    "block_size": {
+      "type": "const",
+      "value": 128,
+      "description": "FP8 quantization group / block size."
+    },
+    "num_hidden_blocks": {
+      "type": "var",
+      "description": "hidden_size / 128."
+    },
+    "num_intermediate_blocks": {
+      "type": "var",
+      "description": "intermediate_size / 128."
+    },
+    "num_gemm1_out_blocks": {
+      "type": "var",
+      "description": "gemm1_out_size / 128."
+    }
+  },
+  "constraints": [
+    "hidden_size % 128 == 0",
+    "intermediate_size % 128 == 0",
+    "gemm1_out_size == 2 * intermediate_size",
+    "num_shared_experts < top_k",
+    "top_k <= num_experts"
+  ],
+  "inputs": {
+    "hidden_states": {
+      "shape": [
+        "num_tokens",
+        "hidden_size"
+      ],
+      "dtype": "bfloat16",
+      "description": "BF16 activations. Quantize each group of 128 using scale = max(amax(abs(group)), 1e-8) / 448, clamped division and FP8 E4M3 rounding. Input quantization runs inside the timed operator; the oracle independently uses eager Torch outside timing."
+    },
+    "topk_ids": {
+      "shape": [
+        "num_tokens",
+        "top_k"
+      ],
+      "dtype": "int32",
+      "description": "Preselected expert IDs in their original route order; no sorting or router-logit reconstruction."
+    },
+    "topk_weights": {
+      "shape": [
+        "num_tokens",
+        "top_k"
+      ],
+      "dtype": "float32",
+      "description": "Original normalized route weights, paired with topk_ids; no BF16 conversion or renormalization."
+    },
+    "gemm1_weights": {
+      "shape": [
+        "num_experts",
+        "gemm1_out_size",
+        "hidden_size"
+      ],
+      "dtype": "float8_e4m3fn",
+      "description": "Gate and up weights per expert, rows stacked [gate; up]."
+    },
+    "gemm1_weights_scale": {
+      "shape": [
+        "num_experts",
+        "num_gemm1_out_blocks",
+        "num_hidden_blocks"
+      ],
+      "dtype": "float32",
+      "description": "128x128 block scales of gemm1_weights."
+    },
+    "gemm2_weights": {
+      "shape": [
+        "num_experts",
+        "hidden_size",
+        "intermediate_size"
+      ],
+      "dtype": "float8_e4m3fn",
+      "description": "Down weights per expert."
+    },
+    "gemm2_weights_scale": {
+      "shape": [
+        "num_experts",
+        "num_hidden_blocks",
+        "num_intermediate_blocks"
+      ],
+      "dtype": "float32",
+      "description": "128x128 block scales of gemm2_weights."
+    },
+    "top_k": {
+      "shape": null,
+      "dtype": "int32"
+    },
+    "routed_scaling_factor": {
+      "shape": null,
+      "dtype": "float32",
+      "description": "Scalar applied to every routed contribution."
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "num_tokens",
+        "hidden_size"
+      ],
+      "dtype": "bfloat16",
+      "description": "BF16 sum over the supplied routes of routed_scaling_factor * topk_weights * expert(x). Every case uses max(atol + rtol * abs(ref), 2 * abs_sum * 2**-7), with atol = rtol = 0.1 by default; no contribution-count-based exact-equality exception."
+    }
+  },
+  "reference": "import torch\n\n\nBLOCK_SIZE = 128\nFP8_MAX = 448.0\n\n\ndef _quantize_per_token_group(values):\n    \"\"\"PR #4287's FP32 intermediate requantization (unchanged).\"\"\"\n    rows, columns = values.shape\n    groups = values.float().reshape(rows, columns // BLOCK_SIZE, BLOCK_SIZE)\n    scales = groups.abs().amax(dim=-1).clamp_min(1.0e-8) / FP8_MAX\n    quantized = (groups / scales.unsqueeze(-1)).clamp(-FP8_MAX, FP8_MAX)\n    return quantized.to(torch.float8_e4m3fn).reshape(rows, columns), scales\n\n\ndef _quantize_inputs(hidden_states):\n    \"\"\"Independent eager Torch input quantization; never imports a baseline.\"\"\"\n    return _quantize_per_token_group(hidden_states)\n\n\ndef _expand_block_scales(scales):\n    return scales.float().repeat_interleave(BLOCK_SIZE, dim=1).repeat_interleave(\n        BLOCK_SIZE, dim=2\n    )\n\n\n@torch.no_grad()\ndef _reference_quantized(\n    x_q, x_scale, topk_ids, topk_weights,\n    gemm1_weights, gemm1_weights_scale, gemm2_weights, gemm2_weights_scale,\n    top_k, routed_scaling_factor,\n):\n    \"\"\"PR #4287's independent expert oracle on explicit FP8 bytes and routes.\n\n    Gate/up and SwiGLU preserve FP32. Requantize the intermediate per row in\n    groups of 128. Round each routed group-128 down contribution, and each\n    accumulator update, to BF16. Track the absolute contribution mass for the\n    upstream accumulation-order bound. Weights use logical [gate; up] layout.\n    \"\"\"\n    num_tokens, hidden_size = x_q.shape\n    top_k = int(top_k)\n    num_experts, gemm1_out_size, _ = gemm1_weights.shape\n    intermediate_size = gemm1_out_size // 2\n    device = x_q.device\n\n    assert x_q.dtype == torch.float8_e4m3fn\n    assert hidden_size % BLOCK_SIZE == 0 and intermediate_size % BLOCK_SIZE == 0\n    assert x_scale.shape == (num_tokens, hidden_size // BLOCK_SIZE)\n    assert topk_ids.shape == topk_weights.shape == (num_tokens, top_k)\n    assert gemm1_weights_scale.shape == (\n        num_experts, gemm1_out_size // BLOCK_SIZE, hidden_size // BLOCK_SIZE,\n    )\n    assert gemm2_weights.shape == (num_experts, hidden_size, intermediate_size)\n    assert gemm2_weights_scale.shape == (\n        num_experts, hidden_size // BLOCK_SIZE, intermediate_size // BLOCK_SIZE,\n    )\n\n    pair_expert = topk_ids.reshape(-1).to(torch.int64)\n    flat_weights = topk_weights.reshape(-1)\n    x = x_q.float() * x_scale.repeat_interleave(BLOCK_SIZE, dim=1)\n    w1 = gemm1_weights.float() * _expand_block_scales(gemm1_weights_scale)\n    w2 = gemm2_weights.float() * _expand_block_scales(gemm2_weights_scale)\n\n    output = torch.zeros((num_tokens, hidden_size), dtype=torch.bfloat16, device=device)\n    abs_sum = torch.zeros((num_tokens, hidden_size), dtype=torch.float32, device=device)\n    for expert in range(num_experts):\n        pair_indices = torch.nonzero(pair_expert == expert, as_tuple=False).flatten()\n        if pair_indices.numel() == 0:\n            continue\n        tokens = torch.div(pair_indices, top_k, rounding_mode=\"floor\")\n        gate_up = x[tokens] @ w1[expert].t()\n        gate, up = gate_up[:, :intermediate_size], gate_up[:, intermediate_size:]\n        activated = torch.nn.functional.silu(gate) * up\n        act_q, act_scale = _quantize_per_token_group(activated)\n        activated = act_q.float() * act_scale.repeat_interleave(BLOCK_SIZE, dim=1)\n        for base in range(0, intermediate_size, BLOCK_SIZE):\n            down = activated[:, base : base + BLOCK_SIZE] @ w2[\n                expert, :, base : base + BLOCK_SIZE\n            ].t()\n            down *= flat_weights[pair_indices, None] * float(routed_scaling_factor)\n            contribution = down.to(torch.bfloat16)\n            output[tokens] = (output[tokens].float() + contribution.float()).to(torch.bfloat16)\n            abs_sum[tokens] += contribution.float().abs()\n    return output, abs_sum\n\n\ndef reference_for_check_quantized(*args, atol=0.1, rtol=0.1):\n    \"\"\"Kernel-level entry for the PR's published, prequantized contract cases.\"\"\"\n    expected, abs_sum = _reference_quantized(*args)\n    # Even one or two BF16 contributions can differ: the kernel applies\n    # FP32 block scales after its FP8 dot and uses fast nonlinear arithmetic.\n    # The independent dequantized Torch math is not bitwise equivalent.\n    bound = torch.maximum(atol + rtol * expected.float().abs(), 2.0 * abs_sum * 2.0**-7)\n    return expected, bound\n\n\ndef reference_for_check(hidden_states, *args, atol=0.1, rtol=0.1):\n    x_q, x_scale = _quantize_inputs(hidden_states)\n    return reference_for_check_quantized(x_q, x_scale, *args, atol=atol, rtol=rtol)\n\n\ndef run(hidden_states, topk_ids, topk_weights, gemm1_weights, gemm1_weights_scale,\n        gemm2_weights, gemm2_weights_scale, top_k, routed_scaling_factor):\n    return reference_for_check(\n        hidden_states, topk_ids, topk_weights, gemm1_weights, gemm1_weights_scale,\n        gemm2_weights, gemm2_weights_scale, top_k, routed_scaling_factor,\n    )[0]\n"
+}

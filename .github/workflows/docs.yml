@@ -1,0 +1,71 @@
+name: Documentation
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: documentation-${{ github.event_name == 'pull_request' && github.ref || 'publish' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: docs/requirements.txt
+      - name: Install documentation dependencies
+        run: |
+          uv venv --python 3.12 .local/docs-venv
+          uv pip install --python .local/docs-venv/bin/python -r docs/requirements.txt
+      - name: Build the documentation
+        run: |
+          .local/docs-venv/bin/python -m sphinx -E -a -b html -n -W --keep-going \
+            -d docs/_build/doctrees docs docs/_build/site/docs
+          cp -a docs/_hosting/. docs/_build/site/
+          printf '{"repository":"mlc-ai/TIRx-harness","commit":"%s"}\n' "$GITHUB_SHA" > docs/_build/site/source.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: documentation-html
+          path: docs/_build/site
+          include-hidden-files: true
+          if-no-files-found: error
+
+  publish:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: mlc-ai/tirxharness-docs
+          ref: main
+          ssh-key: ${{ secrets.DOCS_PUBLISH_KEY }}
+          path: published
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: documentation-html
+          path: website
+      - name: Synchronize the documentation website
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          rsync -a --delete --exclude=.git website/ published/
+          git -C published config user.name 'github-actions[bot]'
+          git -C published config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git -C published add --all
+          if ! git -C published diff --cached --quiet; then
+            git -C published commit -m "Publish documentation from $SOURCE_SHA"
+            git -C published push origin HEAD:main
+          fi

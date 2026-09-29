@@ -1,0 +1,29 @@
+name: fp16_gemm_floor
+workload_dir: candidates/fp16_gemm_floor
+kernel_authoring: tirx-lite
+sota_baseline:
+  name: cublas
+
+banned_paths:
+  - tirx-kernels/tirx_kernels/gemm/**
+  - tirx-kernels/tirx_kernels/ported/flashinfer/gemm/**
+  - tirx-kernels/.agents/sketch/flashinfer/gemm/**
+spec: |
+  Implement FP16 GEMM on B200 (sm_100) and beat cuBLAS across the complete
+  benchmark shape set on aggregate GPU-only latency.
+
+  Compute D[M,N] = A[M,K] @ B[N,K]^T for fp16 A and B, with fp32-equivalent
+  accumulation and fp16 output. The 12 packaged workload rows include square
+  matrices, LLM FFN projections, and mixed aspect ratios, with dimensions from
+  1024 through 11008; every row is part of the contract.
+
+  Version contract: solution.py exports setup(data, M, N, K) -> callable.
+  data contains A, B, and preallocated D. setup may compile, allocate scratch,
+  and execute one warmup call; every timed invocation must read A/B and
+  overwrite D. Do not call cuBLAS, torch.matmul, PyTorch tensor operators,
+  Triton, CUTE DSL, raw CUDA, or an existing solution kernel for production
+  computation.
+
+  Correctness requires torch-isclose rtol=0.01, atol=0.1 for at least 99% of
+  elements on every shape. Speedup is sum(cuBLAS GPU time) /
+  sum(candidate GPU time) across all 12 shapes.

@@ -1,0 +1,88 @@
+{
+  "name": "wan_hybrid_attention_b1_s4800_h40_d128_bf16",
+  "description": "Wan video serving attention (flashinfer PR #4543 'wan_hybrid' backend): dense non-causal attention over contiguous NHD bf16 q/k/v at the fixed B1/S4800/H40/D128 serving contract. The target kernel keeps QK^T in bf16 and runs the P.V stage with NVFP4 probabilities and two-level NVFP4 values; the contract is the bf16 attention it approximates.",
+  "op_type": "attention",
+  "tags": [
+    "status:synthetic",
+    "stage:forward",
+    "dtype:bfloat16",
+    "model:wan2.1",
+    "quantization:nvfp4-pv",
+    "layout:nhd",
+    "kernel:wan-hybrid"
+  ],
+  "axes": {
+    "batch_size": {
+      "type": "const",
+      "value": 1
+    },
+    "seq_len": {
+      "type": "const",
+      "value": 4800,
+      "description": "Query and key/value length (61x448x832 latent grid)."
+    },
+    "num_heads": {
+      "type": "const",
+      "value": 40,
+      "description": "Attention heads (no GQA)."
+    },
+    "head_dim": {
+      "type": "const",
+      "value": 128
+    }
+  },
+  "constraints": [
+    "q.shape == k.shape == v.shape == (1, 4800, 40, 128)",
+    "q.dtype == k.dtype == v.dtype == torch.bfloat16",
+    "non-causal"
+  ],
+  "inputs": {
+    "q": {
+      "shape": [
+        "batch_size",
+        "seq_len",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Post-RoPE queries, NHD, contiguous."
+    },
+    "k": {
+      "shape": [
+        "batch_size",
+        "seq_len",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Post-RoPE keys, NHD, contiguous."
+    },
+    "v": {
+      "shape": [
+        "batch_size",
+        "seq_len",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Values, NHD, contiguous."
+    },
+    "sm_scale": {
+      "shape": null,
+      "dtype": "float32",
+      "description": "Softmax scale, 1/sqrt(head_dim)."
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "batch_size",
+        "seq_len",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    }
+  },
+  "reference": "import torch\nimport torch.nn.functional as F\n\n\n@torch.no_grad()\ndef run(q, k, v, sm_scale):\n    \"\"\"PR #4543's BF16 SDPA correctness reference (FA4 is timing only).\"\"\"\n    return F.scaled_dot_product_attention(\n        q.permute(0, 2, 1, 3), k.permute(0, 2, 1, 3), v.permute(0, 2, 1, 3),\n        scale=float(sm_scale),\n    ).permute(0, 2, 1, 3).contiguous()\n"
+}

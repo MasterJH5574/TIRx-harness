@@ -1,0 +1,32 @@
+.local/
+/.venv/
+/tirx-kernels/
+/skills/tirx-wiki/references/repos/tirx-kernels/
+/check-*/
+/.agents/skills/*
+/.claude/skills/*
+.claude/settings.local.json
+
+__pycache__/
+*.pyc
+/build/
+/dist/
+/*.egg-info/
+tirx_harness/build/
+tirx_harness/frontend-rs/target/
+tirx_harness/frontend-rs/thirdparty/
+tirx_harness/dist/
+tirx_harness/src/*.egg-info/
+tirx_harness/src/tirx_harness/numsim/_tvm_rust_ext.*.so
+tirx_harness/src/tirx_harness/numsim/_tvm_rust_ext.pyd
+tirx_harness/src/tirx_harness/numsim/_tvm_rust_ext.identity
+tirx_harness/src/tirx_harness/numsim/_thirdparty_licenses/
+
+# KDA run outputs
+/kda_flow_runs/
+
+# debug/profile tool-defect backlog — transient per-machine bug folders
+/bugs/
+
+# Generated documentation
+/docs/_build/

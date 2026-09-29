@@ -1,0 +1,12 @@
+name: kda_flow
+# The KDA worktree gets the complete kernel-authoring, debugging, profiling,
+# and Blackwell/Hopper reference stack. This file is the authority for the
+# installed skill set; setup does not infer skills by scanning directories.
+skills:
+  - KernelWiki
+  - ncu-report-skill
+  - tirx-wiki
+  - tirx-debug-kernel
+  - tirx-profile-kernel
+banned_paths:
+  - tirx_harness/tests/**

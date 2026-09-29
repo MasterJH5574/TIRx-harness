@@ -1,0 +1,69 @@
+name: kda_forward_b1_t8192_h96
+workload_dir: candidates/kda/forward_b1_t8192_h96
+kernel_authoring: tirx-lite
+sota_baseline:
+  name: flash_kda_chunk_kda
+bench_timeout_s: 600
+banned_paths:
+  - tirx-kernels/tirx_kernels/kda/**
+  - tirx-kernels/tirx_kernels/ported/flashinfer/kda/**
+  - tirx-kernels/.agents/sketch/flashinfer/kda/**
+spec: |
+  Implement Kimi Delta Attention FORWARD on B200 (sm_100).
+
+  Benchmark exactly the KDA-internal fixed H=96 row `kda-fwd-h96-fixed`:
+  one sequence with outer batch B=1, T=8192 tokens, H=96 heads, and K=V=128.
+  Do not broaden the goal to H=64 or the two packed-varlen cases. Inputs are
+  q/k/v/g bf16[1,8192,96,128], raw update logits beta bf16[1,8192,96],
+  A_log fp32[96], dt_bias fp32[96*128], scalar fp32 scale=1/sqrt(128), and
+  initial_state fp32[1,96,128,128]. cu_seqlens is None for this fixed case.
+  There are two scored outputs: output bf16[1,8192,96,128], and final_state
+  fp32[1,96,128,128] holding the recurrent state after the last token, in the
+  same V-first layout as initial_state. The recurrence starts from the supplied
+  initial state. The timed baseline also produces the final state, so the state
+  epilogue is work both sides pay for.
+
+  Immutable math, independently for each head h, in fp32 conceptually:
+    qhat_t = q_t / sqrt(sum_k(q_t[k]^2) + 1e-6)
+    khat_t = k_t / sqrt(sum_k(k_t[k]^2) + 1e-6)
+    log_decay_t[k] =
+        -5 * sigmoid(exp(A_log[h]) * (fp32(g_t[k]) + dt_bias[h*128+k]))
+    update_t = sigmoid(fp32(beta_t))
+    decayed_t[k,v] = exp(log_decay_t[k]) * state_{t-1}[k,v]
+    residual_t[v] = fp32(v_t[v]) - sum_k(khat_t[k] * decayed_t[k,v])
+    state_t[k,v] =
+        decayed_t[k,v] + update_t * khat_t[k] * residual_t[v]
+    output_t[v] = bf16(scale * sum_k(qhat_t[k] * state_t[k,v]))
+  Tokens are causally ordered inside the sequence. Physical state layout,
+  chunk size, fusion, recomputation, and number of kernels are implementation
+  choices.
+
+  Workload interface: solution.py exports setup(data, B, T, H) -> callable.
+  data contains q/k/v/g/beta/A_log/dt_bias/scale/initial_state/cu_seqlens and
+  preallocated output and final_state buffers. setup may compile, allocate
+  scratch, and execute one complete warmup call. Every returned-callable
+  invocation must consume the raw inputs, overwrite every element of BOTH
+  output and final_state, and include all normalization,
+  gate, beta, recurrent-state initialization, and recurrence work in the timed
+  path. No PyTorch, Triton, CUTE DSL, FlashKDA, raw CUDA, or host-side tensor
+  transformation may perform production computation.
+
+  Correctness matches KDA-internal's authoritative judge. The reference is
+  FLA's Triton chunk_kda (FLA_FLASH_KDA=0), independently of the timed
+  FlashKDA baseline. Every element of both outputs must pass rtol=0.05 and an
+  absolute tolerance of 0.5 times that output's reference RMS. The normalized
+  RMS error ratio
+  RMS(candidate-reference)/(RMS(reference)+1e-8) must stay below 0.03 for each
+  output. Returned tensors must be densely materialized with the reference's
+  dtype, device and count: a candidate that returns only output fails outright.
+  The suite also uses repeated output-poisoning checks.
+
+  Beyond the scored row the suite gates on correctness-only probes that are
+  never timed: seven stress regimes at the operator's numerical edge
+  (saturated, strong, mixed_depth, switch, boundary, correlated, random_depth),
+  two probes checked against an fp64 token-by-token recurrence, and a salted
+  private holdout. This task pins every probe to its own H=96, 8192-token
+  single-sequence shape, so only the gate inputs and values vary. They must all
+  pass; the ill-conditioned correlated and repeated-key probes use a looser
+  0.15 relative-L2 bound. An optimization must therefore be correct for the
+  whole operator, not only for realistic gate inputs.

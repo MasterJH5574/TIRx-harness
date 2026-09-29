@@ -1,0 +1,112 @@
+# Workload declarations
+
+`evolution/tasks/` contains one immutable benchmark contract per task.
+`evolution/toolsets/kda_flow.yaml` is the authority for the skills and shared
+leak bans installed by KDA setup. The loaders live in
+`evolution/preparation/declare.py`.
+
+## Registering a task
+
+Every workload runs through the single packaged entry point:
+
+```text
+python evolution/benchmark/adapter.py <workload_dir> vN
+```
+
+Add the task's inputs, correctness gate, timing baseline, definition, and
+workload rows to `evolution/benchmark/flashinfer_bench_evolve/tasks/`, then
+map its workload directory to that package task in the adapter's `PACKAGED`
+table. Workload leaves contain no committed benchmark source; candidate
+`v<N>/` directories are created only inside generated run worktrees.
+
+The adapter's `PACKAGED` registry fixes each task's shape mode for both local
+and remote scoring. `BENCH_OFFICIAL_SHAPE_MODE` cannot override it. Tasks
+without a specific shape suffix use `all`, including any synthetic stress
+rows supplied by the packaged task. Register single-shape tasks separately
+with a shape suffix, as with KDA forward and backward.
+
+Use `pinned` for selection by a reviewed UUID in
+`adapter.PINNED_WORKLOAD_UUIDS`. Use `max` for the packaged benchmark's
+own largest-shape selection, as the existing KDA forward/backward tasks do.
+The adapter resolves `pinned` rows before passing explicit workloads to the
+packaged benchmark; it delegates `all` and `max` to the package unchanged.
+
+The six CAKE single-shape tasks use explicit dimension suffixes, following
+the existing `kda_forward_b1_t8192_h96` convention:
+
+| Workload | Single-shape task |
+| --- | --- |
+| Alpha-MoE | `alphamoe_m128_e512_topk10_k2048_i128_fp8` |
+| KDA decode | `kda_decode_b128_t1_h16_hv32_d128_bf16` |
+| MLA DSV4 prefill | `mla_dsv4_prefill_b2_qsum386_qmax257_h128_d512_swa16384_c16384_topk1152_bf16_hnd_varlen` |
+| MSA prefill | `msa_prefill_b1_q4096_kv4096_hq64_hkv4_d128_topk16_bf16_flat` |
+| MSA decode | `msa_decode_b128_q16_kv4096_hq64_hkv4_d128_topk16_bf16_flat` |
+| VSA | `vsa_s80000_h8_d128_blk128_topk156_bf16` |
+
+Each task's YAML filename matches its `name`. Its `workload_dir` uses the
+same suffix under the existing workload family (`kda/decode_...`,
+`msa/prefill_...`, and `msa/decode_...`). `hq` and `hkv` distinguish MSA
+query and KV heads; KDA's `h` and `hv` distinguish Q/K and value heads.
+`d`, `blk`, and `topk` denote head dimension, block size, and selection count.
+For Alpha-MoE, `m`, `e`, `k`, and `i` denote tokens, experts, hidden size,
+and intermediate size; `fp8` refers to weights and quantized computation,
+with bf16 activation inputs.
+
+Alpha-MoE, KDA decode, MSA prefill/decode and VSA use fixed sequence lengths.
+For fixed attention tasks, both Q and KV lengths are uniform across
+requests; a uniform `cu_seqlens` array is compatible with this rule.
+
+MLA DSV4 explicitly selects the large varlen prefill row. Its `qsum386` and
+`qmax257` suffixes mean 386 total queries and at most 257 per request; the
+actual Q lengths are [129,257]. The SWA and compressed KV pools have base
+lengths 16384, with actual lengths [16384,16640] and [16384,16448]. All KV
+lengths fill complete pages. `topk1152` is the sparse width including 128
+SWA slots; active sparse lengths vary from 832 to 1152. Query and pools
+use bf16/HND. The row has 56,918,016 nominal query/key pairs across heads
+and 49,545,216 valid pairs. Its 4K-pool counterpart has the same pair counts;
+the selected 16K row uses larger KV pools. This task retains the original
+varlen contract and published seed.
+
+`nvfp4_attention` already contains one row and has no duplicate. Each
+single-shape declaration states the selected official row and its full
+contract. The six choices favor substantial work within the intended
+contract and baseline arm, with consistent storage. Power-of-two block
+counts are not required.
+All six tasks use the `pinned` mode. `adapter.PINNED_WORKLOAD_UUIDS`
+selects their reviewed official rows for both local and remote scoring.
+Pinned selection excludes synthetic stress rows and requires exactly one
+matching official UUID. It preserves original row metadata, including seeds,
+and uses the full official list regardless of `BENCH_INCLUDE_OFFICIAL` or
+`BENCH_MAX_OFFICIAL`. Other tasks keep their existing shape selection.
+
+Declare the optimization contract in `evolution/tasks/<name>.yaml`:
+
+```yaml
+name: my_kernel
+workload_dir: candidates/my_kernel
+kernel_authoring: tirx-lite
+sota_baseline:
+  name: baseline_name
+bench_timeout_s: 120
+banned_paths:
+  - .claude/skills/tirx-wiki/references/repos/baseline-source/**
+spec: |
+  Complete immutable math, tensor, interface, correctness, and scoring
+  contract for the workload.
+```
+
+`name`, `workload_dir`, `kernel_authoring`, `sota_baseline.name`, and a
+non-empty `spec` are required. `kernel_authoring` is `tirx-lite` for the shared tirx-lite
+contract or `task` when the task spec defines another implementation language.
+`bench_timeout_s`, when present, must be positive.
+
+## Leak bans
+
+- Ban the workload's own SOTA source and any prior solution corpus.
+- Setup also bans the source checkout and other run directories, while
+  allowing the current run to access its own files.
+- Source carrying a reference implementation is physically removed from the
+  generated worktree; the hook is an additional access boundary, not a
+  substitute for removal.
+- Shared prior-solution corpora belong in `evolution/toolsets/kda_flow.yaml`;
+  workload-specific bans belong in the task YAML.

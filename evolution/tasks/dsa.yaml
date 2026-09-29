@@ -1,0 +1,35 @@
+name: dsa
+workload_dir: candidates/dsa
+kernel_authoring: tirx-lite
+sota_baseline:
+  name: trtllm_mla_sparse
+banned_paths: []
+spec: |
+  Implement DeepSeek-V3.2 DSA paged sparse attention on B200 (sm_100) and
+  beat the TensorRT-LLM sparse MLA baseline on GPU-only latency.
+
+  For each token t and query head h, gather the valid flattened cache token
+  indices from sparse_indices[t] (`-1` is padding), then compute
+    score_j = sm_scale * (dot(q_nope[t,h], ckv_cache[idx_j])
+                          + dot(q_pe[t,h], kpe_cache[idx_j])).
+  Softmax is over valid j only and the output is the probability-weighted
+  sum of the selected ckv rows. An all-padding row produces zeros. Cache
+  token idx maps to `(page=idx//64, offset=idx%64)`.
+
+  Shapes: q_nope bf16[num_tokens,16,512], q_pe bf16[num_tokens,16,64],
+  ckv_cache bf16[num_pages,64,512], kpe_cache bf16[num_pages,64,64],
+  sparse_indices int32[num_tokens,2048], and scalar fp32 sm_scale
+  (the official trace uses 1/sqrt(192)). The observable output is
+  O bf16[num_tokens,16,512]. Logits and softmax accumulation are fp32
+  conceptually; padding contributes neither probability nor output.
+
+  Version contract: solution.py exports setup(data, num_tokens, num_pages) ->
+  callable. data contains q_nope/q_pe/ckv_cache/kpe_cache/sparse_indices,
+  sm_scale, preallocated O, and an auxiliary LSE slot. setup may compile and
+  allocate scratch and may execute one warmup call; each timed callable must
+  consume the inputs and overwrite O. Do not call FlashInfer, TensorRT-LLM,
+  PyTorch tensor operators, Triton, CUTE DSL, raw CUDA, or an existing
+  solution kernel for production computation.
+
+  Correctness uses atol=0.01, rtol=0.01, and matched_ratio>=0.999. The adapter
+  scores all official rows and the packaged synthetic stress rows.

@@ -1,0 +1,126 @@
+{
+  "name": "vsa_block_sparse_attention_d128_bf16",
+  "description": "Video Sparse Attention (VSA) block-sparse prefill with the flashinfer BlockSparseAttentionWrapper vsa_blackwell / vsa_blackwell_blk64 contract that flashinfer PR #4593's Cake VSA backend implements: bf16 D=128 q/k/v in [S, H, D] with native heads, square 64- or 128-token blocks (MB = NB = S / block_size), no causal mask. Sparsity is given natively as q2k_indices int32 [H, MB, topk] (the distinct KV blocks each head's query block attends to; uniform top-k, every row selects >= 1 block) plus, on 64-token-block rows only, kv_block_lens int32 [NB] in [1, block_size] giving the valid tokens at the front of each KV block (FastWan partial tiles; None when every block is full). The output is [S, H, D] bf16 and only the output is returned (the long-sequence Cake route has no LSE). Workloads: PR #4612's blk128 compress-top-k sweep (S=16384/32768/80000, H=8), its blk64 head-shared random-BSR sweep (S=1024/2048/4096 at 25/50/75% density), and two FastWan (Wan2.1-1.3B, 12 heads) rows at sparsity 0.8, one with 52 partial 32-token blocks.",
+  "op_type": "attention",
+  "tags": [
+    "status:synthetic",
+    "stage:prefill",
+    "dtype:bfloat16",
+    "model:wan2.1",
+    "sparsity:block-sparse",
+    "kernel:vsa-blackwell"
+  ],
+  "axes": {
+    "seq_len": {
+      "type": "var",
+      "description": "Query and key/value tokens (S = M = N); a multiple of block_size."
+    },
+    "num_heads": {
+      "type": "var",
+      "description": "Query = key/value heads (H)."
+    },
+    "head_dim": {
+      "type": "const",
+      "value": 128,
+      "description": "Head dimension."
+    },
+    "block_size": {
+      "type": "var",
+      "description": "Square block size R = C, 64 or 128."
+    },
+    "num_blocks": {
+      "type": "var",
+      "description": "seq_len / block_size (MB = NB)."
+    },
+    "topk": {
+      "type": "var",
+      "description": "KV blocks selected per (head, query block)."
+    },
+    "head_shared_mask": {
+      "type": "var",
+      "description": "1 when every head uses the same block list (PR #4612 blk64 BSR recipe), 0 for per-head pooled top-k."
+    },
+    "num_partial_blocks": {
+      "type": "var",
+      "description": "KV blocks with fewer than block_size valid tokens (0: kv_block_lens is None)."
+    },
+    "partial_block_len": {
+      "type": "var",
+      "description": "Valid tokens in each partial block (0 when there are none)."
+    }
+  },
+  "constraints": [
+    "seq_len % block_size == 0",
+    "block_size in (64, 128)",
+    "1 <= topk <= num_blocks; block ids within a q2k_indices row are distinct and in [0, num_blocks)",
+    "num_partial_blocks == 0 implies kv_block_lens is None; block_size == 128 implies kv_block_lens is None",
+    "q.dtype == k.dtype == v.dtype == torch.bfloat16"
+  ],
+  "inputs": {
+    "q": {
+      "shape": [
+        "seq_len",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Queries, contiguous [S, H, D]."
+    },
+    "k": {
+      "shape": [
+        "seq_len",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Keys, contiguous [S, H, D]."
+    },
+    "v": {
+      "shape": [
+        "seq_len",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Values, contiguous [S, H, D]."
+    },
+    "q2k_indices": {
+      "shape": [
+        "num_heads",
+        "num_blocks",
+        "topk"
+      ],
+      "dtype": "int32",
+      "description": "KV block ids attended by each (head, query block); ascending within a row."
+    },
+    "kv_block_lens": {
+      "shape": [
+        "num_blocks"
+      ],
+      "dtype": "int32",
+      "description": "Valid tokens at the front of each KV block, in [1, block_size]; None when all blocks are full."
+    },
+    "block_size": {
+      "shape": null,
+      "dtype": "int32",
+      "description": "Query and KV block size (64 or 128)."
+    },
+    "sm_scale": {
+      "shape": null,
+      "dtype": "float32",
+      "description": "Softmax scale, 1/sqrt(head_dim)."
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "seq_len",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Attention output over the selected blocks' valid keys; a fresh tensor."
+    }
+  },
+  "reference": "import math\n\nimport torch\n\n\n@torch.no_grad()\ndef run(q, k, v, q2k_indices, kv_block_lens, block_size, sm_scale):\n    \"\"\"\n    VSA block-sparse attention (flashinfer BlockSparseAttentionWrapper\n    vsa_blackwell / cake_vsa semantics) in fp32, a chunk of query blocks at\n    a time:\n\n    \u2022 q, k, v are [S, H, D] with native heads (Hq == Hkv); square\n      block_size x block_size tiles, MB = NB = S // block_size; no causal\n      mask, no positional encoding.\n    \u2022 q2k_indices [H, MB, topk] int32 lists, per head and query block, the\n      distinct KV blocks that query block attends to (every row selects at\n      least one block). Every token of a selected block is a key, except\n      that when kv_block_lens[block] < block_size only the first\n      kv_block_lens[block] tokens of that block are valid (padding tail).\n    \u2022 out[s, h] = softmax(sm_scale * q[s, h] . k[keys, h]) @ v[keys, h] over\n      the valid keys of the blocks selected for s's query block; padded\n      query rows are computed like any other row. sm_scale None means\n      1/sqrt(D). The output has q's dtype.\n    \"\"\"\n\n    S, H, D = q.shape\n    B = int(block_size)\n    MB, NB = S // B, k.shape[0] // B\n    topk = q2k_indices.shape[-1]\n    scale = float(sm_scale) if sm_scale is not None else 1.0 / math.sqrt(D)\n    device = q.device\n    heads = torch.arange(H, device=device)[:, None, None]\n    idx = q2k_indices.to(device=device, dtype=torch.int64)  # [H, MB, topk]\n    qh = q.float().view(MB, B, H, D).permute(2, 0, 1, 3)  # [H, MB, B, D]\n    kh = k.float().view(NB, B, H, D).permute(2, 0, 1, 3)  # [H, NB, B, D]\n    vh = v.float().view(NB, B, H, D).permute(2, 0, 1, 3)\n    valid = None\n    if kv_block_lens is not None:\n        lens = kv_block_lens.to(device=device, dtype=torch.int64)\n        valid = torch.arange(B, device=device)[None, :] < lens[:, None]  # [NB, B]\n    out = torch.empty(H, MB, B, D, dtype=torch.float32, device=device)\n    # ~64M gathered fp32 elements per chunk: ~1 GB peak at S=80000, 156 blocks/row.\n    chunk = max(1, (64 << 20) // (H * topk * B * D))\n    for start in range(0, MB, chunk):\n        stop = min(start + chunk, MB)\n        rows = idx[:, start:stop]  # [H, m, topk]\n        keys = kh[heads, rows].flatten(2, 3)  # [H, m, topk*B, D]\n        vals = vh[heads, rows].flatten(2, 3)\n        scores = torch.einsum(\"hmrd,hmnd->hmrn\", qh[:, start:stop], keys) * scale\n        if valid is not None:\n            dead = ~valid[rows].flatten(2, 3)[:, :, None, :]  # [H, m, 1, topk*B]\n            scores = scores.masked_fill(dead, float(\"-inf\"))\n        probs = torch.softmax(scores, dim=-1)\n        out[:, start:stop] = torch.einsum(\"hmrn,hmnd->hmrd\", probs, vals)\n    return out.permute(1, 2, 0, 3).reshape(S, H, D).to(q.dtype)\n"
+}

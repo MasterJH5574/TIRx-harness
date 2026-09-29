@@ -1,0 +1,57 @@
+name: gdn_prefill
+workload_dir: candidates/gdn/prefill
+kernel_authoring: tirx-lite
+sota_baseline:
+  name: flashinfer_chunk_gated_delta_rule
+bench_timeout_s: 120
+banned_paths:
+  - tirx-kernels/tirx_kernels/ported/flashinfer/gdn_prefill/**
+  - tirx-kernels/.agents/sketch/flashinfer/gdn_prefill/**
+spec: |
+  Implement Gated Delta Net (Qwen3-Next) PREFILL on B200 (sm_100) and
+  beat `flashinfer.chunk_gated_delta_rule` on kernel-only latency.
+
+  Algorithm: the CHUNKWISE gated delta rule over packed varlen sequences.
+  Each sequence is split into blocks of B tokens; a recurrent state H[V, K]
+  per (seq, value-head) is carried across blocks — within a block, outputs
+  combine an intra-block causal contribution (WY-form construction) with the
+  carried inter-block state, then the state is updated once per block. Gate
+  inputs are consumed as g = -exp(A_log) * softplus(fp32(a) + dt_bias) and
+  beta = sigmoid(fp32(b)), per token and value-head.
+  For each sequence and value head h (query/key head h//2), carry state
+  H[V,K] across implementation-chosen token blocks. Within one block, define
+  g_i=-exp(A_log[h])*softplus(fp32(a_i)+dt_bias[h]), beta_i=sigmoid(fp32(b_i)),
+  G_i=sum_{r<=i}g_r, and strictly lower-triangular
+  R_ij=beta_i*dot(k_i,k_j)*exp(G_i-G_j) for i>j. Let A=(I+R)^-1,
+  U=A@(beta*v), and W=A@(beta*exp(G)*k). Then
+    vnew_i = U_i - H @ W_i
+    output_i = bf16(scale * (exp(G_i)*(H@q_i)
+                 + sum_{j<=i} dot(q_i,k_j)*exp(G_i-G_j)*vnew_j))
+  and after the block
+    H = exp(G_last)*H
+        + sum_j exp(G_last-G_j)*outer(vnew_j,k_j).
+  Publish the final H for each sequence/head. This blockwise recurrence is
+  the immutable math contract; block size and schedule are implementation
+  choices.
+
+  Shapes (run() contract): q,k bf16[total_T, HQK=4, K=128]; v bf16[total_T,
+  HV=8, V=128] (grouped, G = HV/HQK = 2); state fp32[num_seqs, HV, V, K];
+  gates A_log fp32[HV], a,b bf16[total_T, HV], dt_bias fp32[HV];
+  cu_seqlens int64[num_seqs+1]. Outputs: output bf16[total_T, HV, V],
+  new_state fp32[num_seqs, HV, V, K]. Official varlen-packed traces span
+  total_T=6-8192 and num_seqs=1-57; synthetic stress rows add
+  (total_T, num_seqs)=(16384,64) and (32768,128).
+  The kernel must respect cu_seqlens boundaries.
+
+  Correctness: atol=0.01, rtol=0.01, matched_ratio=1.0 (adapter.py checks this).
+  The adapter scores all official trace workloads and both synthetic stress rows.
+
+  Use tensor cores and TMA whenever possible through explicit low-level
+  operations: map the GEMM-shaped stages (KKT, QK, W/U products, state update,
+  outputs) onto the reviewed tcgen05 or warp-level MMA forms, and express bulk
+  GMEM<->SMEM transfers with explicit TensorMaps, pointers, and completion
+  barriers. Do not introduce the legacy tile-authoring helpers.
+
+  Required schedule structure: implement this as a persistent kernel with an
+  in-kernel tile scheduler loop, not a runtime-scheduled grid with one CTA per
+  chunk/tile as the primary execution structure.

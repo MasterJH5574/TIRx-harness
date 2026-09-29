@@ -1,0 +1,174 @@
+{
+  "name": "msa_sparse_prefill_hd128_blk128",
+  "description": "MiniMax sparse attention prefill with the flashinfer.msa_ops.msa_sparse_attention contract (flashinfer PR #4355): each query token attends only the 128-token KV blocks selected for its kv head in q2k_indices, bottom-right causal (token i of a sequence sits at KV position kv_len - q_len + i), GQA, head_dim 128, softmax_scale 1/sqrt(128). K/V are flat varlen (cu_seqlens_k) or paged in 128-token pages (page_table, seqused_k); q is bf16/fp16 and K/V share its dtype or are fp8 E4M3 with a bf16 q. Output is [total_q, num_qo_heads, head_dim] in q's dtype; a token with an empty selection gets zeros. Workloads are the PR benchmark's three prefill rows.",
+  "op_type": "sparse_attention",
+  "tags": [
+    "status:synthetic",
+    "stage:prefill",
+    "sparse:block-topk",
+    "model:minimax-m3",
+    "kernel:msa-sparse-prefill"
+  ],
+  "axes": {
+    "batch_size": {
+      "type": "var",
+      "description": "Sequences (requests) per call."
+    },
+    "seqlen_q": {
+      "type": "var",
+      "description": "Query tokens per sequence."
+    },
+    "seqlen_kv": {
+      "type": "var",
+      "description": "KV tokens per sequence (kv_len)."
+    },
+    "num_qo_heads": {
+      "type": "var",
+      "description": "Query heads (Hq)."
+    },
+    "num_kv_heads": {
+      "type": "var",
+      "description": "KV heads (Hkv); Hq % Hkv == 0."
+    },
+    "head_dim": {
+      "type": "const",
+      "value": 128,
+      "description": "Query, key and value head dimension."
+    },
+    "block_size": {
+      "type": "const",
+      "value": 128,
+      "description": "Tokens per selectable KV block and per KV page."
+    },
+    "topk": {
+      "type": "var",
+      "description": "Selected KV blocks per (kv head, query token); -1 padded."
+    },
+    "total_q": {
+      "type": "var",
+      "description": "batch_size * seqlen_q."
+    },
+    "total_k": {
+      "type": "var",
+      "description": "Flat rows: batch_size * seqlen_kv tokens; 0 on paged rows."
+    },
+    "num_pages": {
+      "type": "var",
+      "description": "Paged rows: total 128-token pages; 0 on flat rows."
+    },
+    "max_pages": {
+      "type": "var",
+      "description": "Paged rows: page_table columns (ceil(seqlen_kv / 128)); 0 on flat rows."
+    },
+    "cu_seqlens_len": {
+      "type": "var",
+      "description": "batch_size + 1."
+    },
+    "kv_layout": {
+      "type": "var",
+      "description": "'flat' (cu_seqlens_k) or 'paged' (page_table, seqused_k)."
+    },
+    "q_dtype": {
+      "type": "var",
+      "description": "'bfloat16' or 'float16'."
+    },
+    "kv_dtype": {
+      "type": "var",
+      "description": "q_dtype, or 'float8_e4m3fn' with a bfloat16 q (no scales)."
+    },
+    "seed": {
+      "type": "var",
+      "description": "flashinfer PR #4355's manifest seed for this row (q/k/v generator; q2k_indices use seed + 101)."
+    }
+  },
+  "constraints": [
+    "num_qo_heads % num_kv_heads == 0",
+    "q2k_indices entries are ascending within a row, -1 padded, and < ceil(kv_len / block_size)",
+    "kv_layout == 'flat' implies page_table and seqused_k are None; kv_layout == 'paged' implies cu_seqlens_k is None",
+    "kv_dtype == q_dtype, or kv_dtype == float8_e4m3fn and q_dtype == bfloat16"
+  ],
+  "inputs": {
+    "q": {
+      "shape": [
+        "total_q",
+        "num_qo_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Queries in q_dtype (bfloat16 or float16), contiguous."
+    },
+    "k": {
+      "shape": [
+        "total_k",
+        "num_kv_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Keys in kv_dtype. Flat rows: [total_k, num_kv_heads, head_dim] indexed by cu_seqlens_k; paged rows: [num_pages, num_kv_heads, block_size, head_dim] (128-token pages) indexed by page_table."
+    },
+    "v": {
+      "shape": [
+        "total_k",
+        "num_kv_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Values in kv_dtype. Flat rows: [total_k, num_kv_heads, head_dim] indexed by cu_seqlens_k; paged rows: [num_pages, num_kv_heads, block_size, head_dim] (128-token pages) indexed by page_table."
+    },
+    "q2k_indices": {
+      "shape": [
+        "num_kv_heads",
+        "total_q",
+        "topk"
+      ],
+      "dtype": "int32",
+      "description": "Per (kv head, query token) ascending batch-local ids of the selected 128-token KV blocks, -1 padded."
+    },
+    "cu_seqlens_q": {
+      "shape": [
+        "cu_seqlens_len"
+      ],
+      "dtype": "int32",
+      "description": "Cumulative query lengths."
+    },
+    "cu_seqlens_k": {
+      "shape": [
+        "cu_seqlens_len"
+      ],
+      "dtype": "int32",
+      "description": "Cumulative KV lengths (flat rows); None on paged rows."
+    },
+    "page_table": {
+      "shape": [
+        "batch_size",
+        "max_pages"
+      ],
+      "dtype": "int32",
+      "description": "Batch-local block id -> page (paged rows); None on flat rows."
+    },
+    "seqused_k": {
+      "shape": [
+        "batch_size"
+      ],
+      "dtype": "int32",
+      "description": "Valid KV tokens per sequence (paged rows); None on flat rows."
+    },
+    "softmax_scale": {
+      "shape": null,
+      "dtype": "float32",
+      "description": "Softmax scale, 1/sqrt(head_dim)."
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "total_q",
+        "num_qo_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Attention output in q's dtype; a new tensor, inputs are not modified."
+    }
+  },
+  "reference": "import torch\n\nBLOCK_SIZE = 128\n\n\n@torch.no_grad()\ndef run(\n    q: torch.Tensor,\n    k: torch.Tensor,\n    v: torch.Tensor,\n    q2k_indices: torch.Tensor,\n    cu_seqlens_q: torch.Tensor,\n    cu_seqlens_k,\n    page_table,\n    seqused_k,\n    softmax_scale: float,\n):\n    \"\"\"\n    MiniMax sparse attention prefill (flashinfer.msa_ops.msa_sparse_attention\n    semantics) in fp32, one sequence at a time:\n\n    \u2022 sequence b owns query tokens cu_seqlens_q[b]:cu_seqlens_q[b+1] and its\n      KV tokens are either cu_seqlens_k[b]:cu_seqlens_k[b+1] of the flat\n      k/v [total_k, Hkv, D] (page_table is None) or the first seqused_k[b]\n      tokens of the 128-token pages page_table[b, :] of the paged k/v\n      [num_pages, Hkv, 128, D], in page order.\n    \u2022 query head h reads kv head h // (Hq // Hkv); token i of sequence b may\n      attend only the tokens of the 128-token KV blocks listed in\n      q2k_indices[kv_head, cu_seqlens_q[b] + i] (batch-local block ids, -1\n      padded) at positions <= kv_len - q_len + i (bottom-right causal).\n    \u2022 softmax over the attended tokens with softmax_scale; a token whose\n      selection is empty gets zeros. fp8 K/V dequantize by plain cast.\n    \u2022 output [total_q, Hq, D] in q's dtype.\n    \"\"\"\n\n    num_qo_heads, head_dim = q.shape[1], q.shape[2]\n    num_kv_heads = k.shape[1]\n    group = num_qo_heads // num_kv_heads\n    device = q.device\n    cu_q = cu_seqlens_q.tolist()\n    if page_table is None:\n        cu_k = cu_seqlens_k.tolist()\n        kv_lens = [cu_k[b + 1] - cu_k[b] for b in range(len(cu_k) - 1)]\n    else:\n        kv_lens = seqused_k.tolist()\n\n    out = torch.zeros(q.shape, dtype=torch.float32, device=device)\n    for b, kv_len in enumerate(kv_lens):\n        q_start, q_end = cu_q[b], cu_q[b + 1]\n        q_len = q_end - q_start\n        if page_table is None:\n            kb = k[cu_k[b] : cu_k[b + 1]].float()\n            vb = v[cu_k[b] : cu_k[b + 1]].float()\n        else:\n            pages = page_table[b, : (kv_len + BLOCK_SIZE - 1) // BLOCK_SIZE].long()\n            kb = k[pages].float().permute(0, 2, 1, 3).reshape(-1, num_kv_heads, head_dim)[:kv_len]\n            vb = v[pages].float().permute(0, 2, 1, 3).reshape(-1, num_kv_heads, head_dim)[:kv_len]\n        qb = q[q_start:q_end].float().view(q_len, num_kv_heads, group, head_dim)\n        selected = q2k_indices[:, q_start:q_end]  # [Hkv, q_len, topk]\n        positions = torch.arange(kv_len, device=device)\n        allowed = (\n            (positions // BLOCK_SIZE).view(1, 1, -1, 1) == selected.unsqueeze(2)\n        ).any(-1)  # [Hkv, q_len, kv_len]\n        q_pos = kv_len - q_len + torch.arange(q_len, device=device)\n        allowed &= positions.view(1, 1, -1) <= q_pos.view(1, -1, 1)\n        allowed = allowed.unsqueeze(2)  # [Hkv, q_len, 1, kv_len]\n        logits = torch.einsum(\"qhgd,khd->hqgk\", qb, kb) * float(softmax_scale)\n        probs = torch.softmax(logits.masked_fill(~allowed, float(\"-inf\")), dim=-1)\n        probs = torch.where(allowed.any(-1, keepdim=True), probs, 0.0)\n        ob = torch.einsum(\"hqgk,khd->qhgd\", probs, vb)\n        out[q_start:q_end] = ob.reshape(q_len, num_qo_heads, head_dim)\n    return out.to(q.dtype)\n"
+}

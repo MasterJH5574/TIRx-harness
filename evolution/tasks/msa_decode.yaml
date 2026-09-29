@@ -1,0 +1,61 @@
+name: msa_decode
+workload_dir: candidates/msa/decode
+kernel_authoring: tirx-lite
+sota_baseline:
+  name: minimax_sparse_atten_func
+bench_timeout_s: 300
+banned_paths:
+  - tirx-kernels/tirx_kernels/msa/**
+  - tirx-kernels/tirx_kernels/ported/msa/**
+  - tirx-kernels/.agents/sketch/msa/**
+spec: |
+  Implement MiniMax sparse decode attention on B200 (sm_100) with the
+  msa_sparse_decode_attention contract. Beat the packaged baseline:
+  MiniMax fmha_sm100 sparse_atten_func
+  on the bf16/fp8 rows, and flashinfer's TensorRT-LLM block-sparse decode
+  bridge (one request per query token) on the two fp16 rows, which
+  MiniMax's forward does not accept. Use the packaged baseline for scoring.
+
+  Inputs, in order, are q, k, v, q2k_indices, cu_seqlens_k, page_table,
+  seqused_k, seqlen_q, softmax_scale. q is contiguous [B*seqlen_q,Hq,128];
+  each request has the same seqlen_q in {1,4,8,16}. Flat K/V are
+  [total_k,Hkv,128]; paged K/V are [num_pages,Hkv,128,128] with 128 tokens
+  per page. q is bf16 or fp16; K/V use q's dtype or fp8_e4m3fn with bf16 q
+  (plain cast, no extra scales). Hq is divisible by Hkv. Output has q's
+  shape/dtype and inputs must remain unchanged.
+  q2k_indices is int32[Hkv,B*seqlen_q,topk], with ascending sequence-local
+  128-token block ids and -1 padding. Flat KV uses cu_seqlens_k int32[B+1],
+  with page_table/seqused_k=None. Paged KV uses page_table int32[B,max_pages]
+  and seqused_k int32[B], with cu_seqlens_k=None. The page table maps local
+  block ids to physical pages; seqused_k gives valid KV lengths.
+  seqlen_q is an int32 scalar and softmax_scale an fp32 scalar, officially
+  1/sqrt(128). No cu_seqlens_q input is supplied for this decode contract.
+
+  Query head h uses KV head h//(Hq/Hkv). Token i of request b is at KV
+  position kv_len[b]-seqlen_q+i; apply this bottom-right causal boundary
+  along with the selected blocks, valid KV lengths and -1 padding. Compute
+  scaled dot-product softmax attention over valid selected tokens; an empty
+  selection returns zeros.
+
+  The ten official rows include standard, speculative and MTP decode,
+  B=2..128, KV lengths 257..65536, bf16/fp16 and mixed fp8 KV, flat/paged
+  storage, and a partial-page boundary case. Follow the explicit workload
+  combinations rather than their Cartesian product.
+
+  Version contract: solution.py exports setup(data, B, seqlen_q) -> callable.
+  data contains the nine inputs above and preallocated output. setup may
+  compile, allocate scratch and shape-only metadata, and execute one warmup
+  call. Each timed call must consume current selection/length/page metadata,
+  perform data-dependent preparation, and overwrite output. The adapter
+  returns (data['output'],). Do not call FlashInfer, MiniMax MSA, PyTorch
+  tensor operators, Triton, CUTE DSL, raw CUDA, or existing solution kernels
+  for production computation.
+
+  Correctness uses an independent sparse-attention oracle, with expected
+  output cast to q's dtype. PyTorch's additive atol+rtol*abs(reference)
+  criterion applies in the output's native dtype on every element:
+  atol=rtol=0.01 for bf16/fp16 KV and atol=rtol=0.1 for fp8 KV.
+  RMS is diagnostic only. Repeated numerical checks and output poisoning
+  remain enabled. The adapter scores all
+  ten official rows. Scoring is packaged baseline latency / candidate
+  latency.

@@ -1,0 +1,56 @@
+name: gdn_decode
+workload_dir: candidates/gdn/decode
+kernel_authoring: tirx-lite
+sota_baseline:
+  name: flashinfer_gated_delta_rule_decode_pretranspose
+bench_timeout_s: 600
+banned_paths:
+  - tirx-kernels/tirx_kernels/ported/flashinfer/gdn_decode/**
+  - tirx-kernels/.agents/sketch/flashinfer/gdn_decode/**
+spec: |
+  Implement Gated Delta Net (Qwen3-Next) DECODE on B200 (sm_100) and
+  beat `flashinfer.gdn_decode.gated_delta_rule_decode_pretranspose` on
+  kernel-only latency.
+
+  Algorithm: single-token gated delta recurrence over a batch of independent
+  decode states. For every batch item n, value head h, and value row r, compute
+  gate_arg = fp32(a[n,0,h]) + dt_bias[h], g = exp(-exp(A_log[h]) *
+  softplus(gate_arg)), beta = sigmoid(fp32(b[n,0,h])), decay the state row by
+  g, compute qdotk, k^T hdec, and q^T hdec over K=128, emit
+  output[n,0,h,r] = bf16(scale * (q^T hdec + beta * (v - k^T hdec) * qdotk)),
+  and update new_state[n,h,r,k] = hdec[k] + k[k] * beta * (v - k^T hdec).
+  This recurrence is the immutable math contract; adapter.py is the
+  exact runtime and correctness contract.
+
+  Shapes (setup(data, B) contract): q,k bf16[B,1,HQK=4,K=128];
+  v bf16[B,1,HV=8,V=128]; state fp32[B,HV,V,K]; gates A_log fp32[HV],
+  a,b bf16[B,1,HV], dt_bias fp32[HV]; scalar scale fp32. Outputs are
+  output bf16[B,1,HV,V] and new_state fp32[B,HV,V,K]. Trace batch sizes are
+  B in {1, 4, 8, 16, 32, 48, 64}; synthetic stress rows add B=128/256/512.
+
+  Correctness: atol=1e-2, rtol=1e-2, matched_ratio=1.0 (no element may
+  exceed both tolerances; any non-finite output fails the row) for both
+  output and new_state across all 54 trace workloads and three synthetic stress
+  rows, judged against the live
+  baseline's outputs. The kernel must respect the
+  fixed head mapping hq = h // 2 and must not clamp/saturate values unless
+  the full sweep is revalidated.
+
+  Version contract: each generated version must provide `setup(data, B) ->
+  callable` from solution.py and should expose `make_kernel(B)` for synccheck /
+  racecheck. setup may compile/cache per B, allocate scalar helpers, and
+  snapshot initial state outside the timed loop; the returned callable must
+  populate output/new_state. Do not wrap or call FlashInfer, Triton, CUTE DSL,
+  CUDA extensions, PyTorch tensor ops, or any existing solution kernel for
+  production computation.
+
+  Explore structurally distinct implementation directions rather than copying
+  an old scalar implementation. One useful starting point is a direct V-tile
+  design that mirrors the math literally: one CTA/program owns
+  `(batch, value_head, V tile)`, reuses q/k/g/beta across that V tile, computes
+  old_v, delta, new_state, and output directly from the recurrence, and uses
+  coalesced K=128 state loads/stores. Use B-specialized V tiling as the starting
+  point, e.g. smaller V tiles for low-B occupancy and larger V tiles for high-B
+  reuse. Other directions may explore row-warp K reductions,
+  query-head-shared q/k reuse, persistent scheduling, staged kernels, and
+  separate low-B launch shapes.

@@ -1,0 +1,52 @@
+name: vsa
+workload_dir: candidates/vsa
+kernel_authoring: tirx-lite
+sota_baseline:
+  name: flashinfer_bsa_attn_fwd
+bench_timeout_s: 300
+banned_paths:
+  - tirx-kernels/tirx_kernels/vsa/**
+  - tirx-kernels/tirx_kernels/ported/cudnn/bsa/**
+  - tirx-kernels/.agents/sketch/cudnn/sm100_bsa*.md
+spec: |
+  Implement Video Sparse Attention on B200 (sm_100).
+  The packaged baseline calls FlashInfer's
+  bsa_attn_fwd or bsa_attn_blk64_fwd, as BlockSparseAttentionWrapper does;
+  it is the packaged library baseline, not a separate Cake implementation.
+
+  Inputs are contiguous q/k/v bf16[S,H,128], q2k_indices
+  int32[H,S/block_size,topk], optional kv_block_lens int32[S/block_size],
+  scalar int32 block_size in {64,128}, and fp32 sm_scale=1/sqrt(128).
+  S is divisible by block_size. Each (head, query block) has a sorted list
+  of distinct KV block ids in [0,S/block_size), with at least one selected
+  block. There is no causal mask or GQA. Compute scaled dot-product softmax
+  attention over the selected blocks' valid tokens and return output
+  bf16[S,H,128]. LSE is not part of the candidate's output contract.
+  kv_block_lens=None means all tokens are valid. Otherwise, only the first
+  kv_block_lens[j] tokens of KV block j participate (lengths 1..block_size);
+  this input is present only on block_size=64 partial-block rows.
+
+  The 18 official rows cover blk128 sequences S=16384/32768/80000 with H=8,
+  blk64 sequences S=1024/2048/4096 with H=8 at several sparsities, and two
+  FastWan rows with H=12, including 52 partial blocks of length 32. Follow
+  the explicit workload rows, including head-shared and per-head masks.
+
+  Version contract: solution.py exports setup(data, S, H, block_size, topk)
+  -> callable. data contains the seven inputs above and preallocated output.
+  setup may compile, allocate scratch and shape-only metadata, and execute
+  one warmup call. Each timed call must consume the current block lists and
+  lengths, perform any data-dependent preparation, and overwrite output.
+  Do not call FlashInfer, cuDNN, PyTorch tensor operators, Triton, CUTE DSL,
+  raw CUDA, or existing solution kernels for production computation.
+
+  Correctness uses the independent masked fp32 attention oracle's bf16
+  output, with atol=rtol=0.01 on every element. For blk128, compare
+  torch.isclose(candidate, ref, atol=0.01, rtol=0.01) in bf16; for blk64,
+  compare torch.isclose(ref.float(), candidate.float(), atol=0.01, rtol=0.01),
+  so the relative tolerance scales with the candidate. Both use PyTorch's
+  additive tolerance rule.
+  RMS is diagnostic only; partial matches are not accepted. Repeated
+  numerical checks and output poisoning remain
+  enabled. The adapter scores all 18 official rows.
+  Scoring is packaged baseline latency / candidate latency, higher is
+  better.

@@ -1,0 +1,58 @@
+name: kda_decode
+workload_dir: candidates/kda/decode
+kernel_authoring: tirx-lite
+sota_baseline:
+  name: recurrent_kda_cutedsl
+bench_timeout_s: 300
+banned_paths:
+  - tirx-kernels/tirx_kernels/kda/**
+  - tirx-kernels/tirx_kernels/ported/flashinfer/kda/**
+  - tirx-kernels/.agents/sketch/flashinfer/kda/**
+spec: |
+  Implement recurrent Kimi Delta Attention decode on B200 (sm_100) and beat
+  flashinfer.kda_decode.recurrent_kda's CuTe-DSL route.
+  The 30 official rows cover tokens per sequence T=1..6, sequence counts
+  N=1..128, H=16 query/key heads, HV in {16,32} value heads, and K=V=128.
+  Use each row's declared combination; this is not a full Cartesian product.
+
+  Inputs, in order, are q, k, v, g, beta, A_log, dt_bias, scale,
+  initial_state, cu_seqlens, ssm_state_indices, num_spec_tokens,
+  num_accepted_tokens, lower_bound. q/k are bf16[B,L,H,128], v/g are
+  bf16[B,L,HV,128], and beta is bf16[B,L,HV], already sigmoid-activated.
+  Standard T=1 uses B=N,L=1; packed speculative decode uses B=1,L=N*T.
+  initial_state is a bf16[P,HV,V,K] pool in V-first layout. scale is fp32.
+  On T=1 rows, the four speculative inputs are None and P=N. On T>=2 rows,
+  cu_seqlens is int32[N+1], ssm_state_indices is int32[N,T], num_spec_tokens
+  is T-1, num_accepted_tokens is int32[N], and P=N*T+6.
+
+  Normalize q/k as x/sqrt(sum(x*x)+1e-6); value head hv uses q/k head
+  hv//(HV/H). On precomputed-gate rows decay=exp(g), and A_log, dt_bias and
+  lower_bound are None. T=3 rows instead use raw g, A_log fp32[H], dt_bias
+  fp32[H*128], and lower_bound=-5: map A_log/bias through the same head
+  grouping and compute decay=exp(-5*sigmoid(exp(A_log)*(g+dt_bias))).
+  With a conceptual K-first state S, each token computes
+    S_decay = S * decay[:,None]
+    S = S_decay + beta * outer(k, v - k @ S_decay)
+    output = scale * q @ S.
+
+  Standard decode reads/writes slot n for sequence n. Speculative decode
+  starts from ssm_state_indices[n,num_accepted_tokens[n]-1] and writes each
+  token t's checkpoint to ssm_state_indices[n,t]. Return output in v's
+  shape/dtype and a new final_state pool in initial_state's shape/dtype.
+  Preserve unmodified slots and never mutate initial_state or cross sequences.
+
+  Version contract: solution.py exports setup(data, N, T) -> callable. data
+  contains all fourteen inputs and preallocated output/final_state. setup
+  may compile, allocate scratch, and execute one warmup call. Each timed
+  call must recompute normalization, gating, recurrence and checkpoints,
+  overwrite output, and restore every final_state slot including untouched
+  slots from initial_state. Do not call FlashInfer, PyTorch tensor operators,
+  Triton, CUTE DSL, raw CUDA, or existing solutions for production computation.
+
+  Correctness compares output and the complete final_state pool to the
+  explicit CuTe-DSL reference. Both sides are cast to fp32, and every element
+  must satisfy abs(candidate-ref)<=0.01+0.01*abs(ref). RMS is diagnostic only.
+  Repeated numerical checks and output poisoning
+  remain enabled.
+  The adapter scores all 30 official rows. Scoring is baseline latency /
+  candidate latency.

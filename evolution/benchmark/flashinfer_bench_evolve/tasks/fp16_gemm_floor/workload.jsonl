@@ -1,0 +1,12 @@
+{"definition":"fp16_gemm_floor","solution":null,"workload":{"uuid":"m1024-n1024-k1024","axes":{"M":1024,"N":1024,"K":1024},"inputs":{"A":{"type":"random"},"B":{"type":"random"}}},"evaluation":null}
+{"definition":"fp16_gemm_floor","solution":null,"workload":{"uuid":"m2048-n2048-k2048","axes":{"M":2048,"N":2048,"K":2048},"inputs":{"A":{"type":"random"},"B":{"type":"random"}}},"evaluation":null}
+{"definition":"fp16_gemm_floor","solution":null,"workload":{"uuid":"m4096-n4096-k4096","axes":{"M":4096,"N":4096,"K":4096},"inputs":{"A":{"type":"random"},"B":{"type":"random"}}},"evaluation":null}
+{"definition":"fp16_gemm_floor","solution":null,"workload":{"uuid":"m8192-n8192-k8192","axes":{"M":8192,"N":8192,"K":8192},"inputs":{"A":{"type":"random"},"B":{"type":"random"}}},"evaluation":null}
+{"definition":"fp16_gemm_floor","solution":null,"workload":{"uuid":"m2048-n11008-k4096","axes":{"M":2048,"N":11008,"K":4096},"inputs":{"A":{"type":"random"},"B":{"type":"random"}}},"evaluation":null}
+{"definition":"fp16_gemm_floor","solution":null,"workload":{"uuid":"m2048-n4096-k11008","axes":{"M":2048,"N":4096,"K":11008},"inputs":{"A":{"type":"random"},"B":{"type":"random"}}},"evaluation":null}
+{"definition":"fp16_gemm_floor","solution":null,"workload":{"uuid":"m4096-n11008-k4096","axes":{"M":4096,"N":11008,"K":4096},"inputs":{"A":{"type":"random"},"B":{"type":"random"}}},"evaluation":null}
+{"definition":"fp16_gemm_floor","solution":null,"workload":{"uuid":"m4096-n4096-k11008","axes":{"M":4096,"N":4096,"K":11008},"inputs":{"A":{"type":"random"},"B":{"type":"random"}}},"evaluation":null}
+{"definition":"fp16_gemm_floor","solution":null,"workload":{"uuid":"m1024-n8192-k2048","axes":{"M":1024,"N":8192,"K":2048},"inputs":{"A":{"type":"random"},"B":{"type":"random"}}},"evaluation":null}
+{"definition":"fp16_gemm_floor","solution":null,"workload":{"uuid":"m8192-n1024-k2048","axes":{"M":8192,"N":1024,"K":2048},"inputs":{"A":{"type":"random"},"B":{"type":"random"}}},"evaluation":null}
+{"definition":"fp16_gemm_floor","solution":null,"workload":{"uuid":"m4096-n2048-k8192","axes":{"M":4096,"N":2048,"K":8192},"inputs":{"A":{"type":"random"},"B":{"type":"random"}}},"evaluation":null}
+{"definition":"fp16_gemm_floor","solution":null,"workload":{"uuid":"m2048-n8192-k1024","axes":{"M":2048,"N":8192,"K":1024},"inputs":{"A":{"type":"random"},"B":{"type":"random"}}},"evaluation":null}

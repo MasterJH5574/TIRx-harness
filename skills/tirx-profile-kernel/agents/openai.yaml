@@ -1,0 +1,4 @@
+interface:
+  display_name: "TIRx Profile Kernel"
+  short_description: "Profile and explain runnable TIRx kernels"
+  default_prompt: "Use $tirx-profile-kernel to run the applicable TIRx performance tools and explain the measured bottleneck."

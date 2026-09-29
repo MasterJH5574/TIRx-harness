@@ -1,0 +1,121 @@
+{
+  "name": "kda_forward_k128_v128_bf16",
+  "description": "Kimi Delta Attention packed-varlen forward with bf16 q/k/v/g/beta activations, fp32 gate parameters and per-sequence initial state, fused q/k L2 normalization, lower-bounded safe gate, beta sigmoid, and V-first recurrent-state layout. Candidates return both the bf16 output and the fp32 final recurrent state; both are scored. The six shapes match KDA-internal: 8192 total tokens, 96 or 64 heads, and fixed, mixed-varlen, or uniform-varlen sequence packing. The full benchmark scores each shape with standard and saturated gate inputs, for 12 cases; saturated inputs set A_log=log(16), dt_bias=0, and g=3. Beyond the timed cases the suite gates candidates on ten untimed stress probes at the operator's numerical edge, two probes checked against an fp64 token-by-token recurrence, and a salted private holdout.",
+  "op_type": "kda",
+  "tags": [
+    "stage:forward",
+    "dtype:bfloat16",
+    "model:kimi-k3",
+    "layout:packed-varlen",
+    "layout:v-first",
+    "status:synthetic",
+    "fused"
+  ],
+  "axes": {
+    "batch_size": {
+      "type": "const",
+      "value": 1,
+      "description": "Packed-varlen input uses a single outer batch dimension."
+    },
+    "total_tokens": {
+      "type": "const",
+      "value": 8192,
+      "description": "Total tokens packed across all independent sequences."
+    },
+    "num_heads": {
+      "type": "var",
+      "description": "Query, key, value, and per-channel gate head count; workloads use 96 or 64."
+    },
+    "head_dim": {
+      "type": "const",
+      "value": 128
+    },
+    "num_seqs": {
+      "type": "var",
+      "description": "Number of independently initialized sequences packed into total_tokens."
+    },
+    "len_cu_seqlens": {
+      "type": "var",
+      "description": "Zero for the single-sequence fixed case, otherwise num_seqs + 1."
+    },
+    "gate_dim": {
+      "type": "var",
+      "description": "Flattened per-head, per-key-channel gate bias dimension."
+    }
+  },
+  "constraints": [
+    "batch_size == 1",
+    "total_tokens == 8192",
+    "num_heads in (96, 64)",
+    "gate_dim == num_heads * head_dim",
+    "(num_seqs == 1 and len_cu_seqlens == 0) or len_cu_seqlens == num_seqs + 1",
+    "q.shape == k.shape == v.shape == g.shape",
+    "q.dtype == torch.bfloat16",
+    "beta.dtype == torch.bfloat16",
+    "initial_state.dtype == torch.float32"
+  ],
+  "inputs": {
+    "q": {
+      "shape": ["batch_size", "total_tokens", "num_heads", "head_dim"],
+      "dtype": "bfloat16",
+      "description": "Raw queries; the kernel applies L2 normalization."
+    },
+    "k": {
+      "shape": ["batch_size", "total_tokens", "num_heads", "head_dim"],
+      "dtype": "bfloat16",
+      "description": "Raw keys; the kernel applies L2 normalization."
+    },
+    "v": {
+      "shape": ["batch_size", "total_tokens", "num_heads", "head_dim"],
+      "dtype": "bfloat16"
+    },
+    "g": {
+      "shape": ["batch_size", "total_tokens", "num_heads", "head_dim"],
+      "dtype": "bfloat16",
+      "description": "Raw per-key-channel gate logits before the lower-bounded safe-gate activation."
+    },
+    "beta": {
+      "shape": ["batch_size", "total_tokens", "num_heads"],
+      "dtype": "bfloat16",
+      "description": "Raw bf16 delta-update gate logits before sigmoid."
+    },
+    "A_log": {
+      "shape": ["num_heads"],
+      "dtype": "float32",
+      "description": "Per-head log decay parameter."
+    },
+    "dt_bias": {
+      "shape": ["gate_dim"],
+      "dtype": "float32",
+      "description": "Flattened per-head, per-key-channel gate bias."
+    },
+    "scale": {
+      "shape": null,
+      "dtype": "float32",
+      "description": "Query/state contraction scale, normally 1/sqrt(head_dim)."
+    },
+    "initial_state": {
+      "shape": ["num_seqs", "num_heads", "head_dim", "head_dim"],
+      "dtype": "float32",
+      "description": "Independent V-first recurrent state for each packed sequence."
+    },
+    "cu_seqlens": {
+      "shape": ["len_cu_seqlens"],
+      "dtype": "int64",
+      "optional": true,
+      "description": "Cumulative sequence offsets for packed varlen cases; None for one fixed-length sequence."
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": ["batch_size", "total_tokens", "num_heads", "head_dim"],
+      "dtype": "bfloat16"
+    },
+    "final_state": {
+      "shape": ["num_seqs", "num_heads", "head_dim", "head_dim"],
+      "dtype": "float32",
+      "description": "Per-sequence recurrent state after the last token of each packed sequence, in the same V-first layout as initial_state. Scored elementwise alongside output, so the state epilogue is part of every candidate's timed work."
+    }
+  },
+  "reference": "import os\n\nimport torch\n\nos.environ[\"FLA_FLASH_KDA\"] = \"0\"\nos.environ[\"FLA_TILELANG\"] = \"0\"\n\nfrom fla.ops.kda import chunk_kda\n\n\n@torch.no_grad()\ndef run(q, k, v, g, beta, A_log, dt_bias, scale, initial_state, cu_seqlens=None):\n    # The harness evaluates this oracle in the same process as the FlashKDA\n    # baseline, which sets FLA_FLASH_KDA=1 on every call. Restore this oracle's\n    # backend per call too, or the two interleave into the same implementation\n    # and the comparison becomes a kernel checked against itself.\n    os.environ[\"FLA_FLASH_KDA\"] = \"0\"\n    os.environ[\"FLA_TILELANG\"] = \"0\"\n    output, final_state = chunk_kda(\n        q=q,\n        k=k,\n        v=v,\n        g=g,\n        beta=beta,\n        scale=float(scale),\n        use_qk_l2norm_in_kernel=True,\n        use_gate_in_kernel=True,\n        use_beta_sigmoid_in_kernel=True,\n        state_v_first=True,\n        safe_gate=True,\n        lower_bound=-5.0,\n        A_log=A_log,\n        dt_bias=dt_bias,\n        initial_state=initial_state,\n        output_final_state=True,\n        cu_seqlens=cu_seqlens,\n    )\n    return output, final_state\n"
+}

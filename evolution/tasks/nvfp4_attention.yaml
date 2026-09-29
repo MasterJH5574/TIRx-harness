@@ -1,0 +1,35 @@
+name: nvfp4_attention
+workload_dir: candidates/nvfp4_attention
+kernel_authoring: tirx-lite
+sota_baseline:
+  name: FA4
+bench_timeout_s: 300
+banned_paths: []
+spec: |
+  Implement Wan hybrid attention with a bf16 attention contract on
+  B200 (sm_100), and beat the packaged production FA4
+  forward baseline (_flash_attn_fwd with pack_gqa=False).
+
+  The single official workload has contiguous q, k, v bf16[1,4800,40,128]
+  in NHD order and scalar fp32 sm_scale=1/sqrt(128). Compute non-causal
+  output=softmax(sm_scale*q@k.T)@v independently per batch/head, and return
+  output bf16[1,4800,40,128]. There is no GQA, dropout, or causal masking.
+  Inputs are already post-RoPE. The approximation used internally may use
+  NVFP4; the observable input/output contract remains bf16 attention.
+
+  Version contract: solution.py exports setup(data, B, S) -> callable, with
+  B=1 and S=4800. data contains q, k, v, sm_scale and preallocated output.
+  setup may compile, allocate scratch, and execute one warmup call. Every
+  timed invocation must consume the inputs, perform any required packing or
+  quantization, and overwrite output. Do not call FA4, FlashInfer, PyTorch
+  tensor operators, Triton, CUTE DSL, raw CUDA, or existing solution kernels
+  for production computation.
+
+  Correctness uses bf16 PyTorch scaled_dot_product_attention as its oracle.
+  Every element must pass native-dtype torch.allclose(atol=1.0, rtol=0.1),
+  using the additive atol+rtol*abs(reference) bound. Flattened fp32 cosine
+  similarity must be >=0.995 and fp32 mean absolute error <=0.025.
+  RMS is diagnostic only. Repeated numerical checks and output poisoning
+  remain enabled. The adapter scores the single
+  official row.
+  Scoring is FA4 latency / candidate latency, higher is better.

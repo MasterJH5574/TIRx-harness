@@ -1,0 +1,72 @@
+name: kda_backward_b1_t8192_h96
+workload_dir: candidates/kda/backward_b1_t8192_h96
+kernel_authoring: tirx-lite
+sota_baseline:
+  name: fla_chunk_kda_training_step
+bench_timeout_s: 300
+banned_paths:
+  - tirx-kernels/tirx_kernels/kda/**
+  - tirx-kernels/tirx_kernels/ported/flashinfer/kda/**
+  - tirx-kernels/.agents/sketch/flashinfer/kda/**
+spec: |
+  Implement the Kimi K3 Delta Attention training step (forward + backward)
+  on B200 (sm_100) from raw layer inputs.
+  Beat the packaged FLA chunk_kda forward plus autograd backward baseline
+  (chunk_size=32, FLA_FLASH_KDA=0), timed as a prepared CUDA-graph replay
+  when evaluating a candidate.
+
+  Inputs use packed variable-length sequences: B=1, T total tokens,
+  N sequences, Hv % Hqk == 0 (grouped value heads), and K=V=128.
+  The benchmark covers exactly the official row kda-bwd-packed-1024x8-h96:
+  T=8192 as eight 1024-token sequences with Hqk=Hv=96 (N=8).
+  Do not broaden the goal to the other packed portfolios or head counts.
+
+  Inputs, in exact order, are:
+    q, k bf16[B,T,Hqk,K]: raw queries and keys
+    v bf16[B,T,Hv,V]
+    g bf16[B,T,Hv,K]: raw gate input
+    beta bf16[B,T,Hv]: raw beta logits
+    A_log fp32[Hv], dt_bias fp32[Hv*K]
+    scale fp32 scalar, officially 1/sqrt(K)
+    initial_state fp32[N,Hv,V,K]: V-first state per sequence
+    cu_seqlens int64[N+1]: packed sequence offsets
+    do bf16[B,T,Hv,V]: upstream output gradient
+    dfinal_state fp32[N,Hv,V,K]: upstream final-state gradient.
+
+  Normalize q/k as x/sqrt(sum(x*x)+1e-6), repeat each q/k head over its
+  Hv/Hqk value heads, and activate beta with sigmoid. The log decay is
+  a=-5*sigmoid(exp(A_log)*(g+dt_bias)), per value head and key channel.
+  With a conceptual K-first working state S, each token computes
+    S_decay = S * exp(a)[:,None]
+    S = S_decay + sigmoid(beta) * outer(k, v - k @ S_decay)
+    output = scale * q @ S.
+  State and gradients must never cross a cu_seqlens boundary. Return the
+  final state in V-first layout. Differentiate both output and final_state
+  using do and dfinal_state with respect to the eight raw differentiable
+  inputs, including normalization and gate/bias transformations.
+
+  Return exactly ten tensors, in this order:
+    output bf16[B,T,Hv,V], final_state fp32[N,Hv,V,K],
+    dq bf16[B,T,Hqk,K], dk bf16[B,T,Hqk,K], dv bf16[B,T,Hv,V],
+    dg bf16[B,T,Hv,K], dbeta bf16[B,T,Hv], dA_log fp32[Hv],
+    ddt_bias fp32[Hv*K], dinitial_state fp32[N,Hv,V,K].
+  Each gradient has its corresponding input's dtype. No saved Aqk/Akk,
+  cumulative gate, or retained forward graph is supplied to the candidate.
+
+  Version contract: solution.py exports setup(data, B, T, H) -> callable,
+  where H is Hqk. data contains the twelve inputs and ten preallocated
+  outputs above, using those exact names. setup may compile, allocate
+  scratch, and execute one complete warmup call. Every timed invocation
+  must redo the full forward and backward computation and overwrite all
+  ten outputs. Data-dependent preprocessing cannot be hoisted into setup.
+  Do not call FLA, PyTorch tensor operators or autograd, Triton, CUTE DSL,
+  FlashKDA, raw CUDA, or existing solution kernels for production computation.
+
+  Correctness compares all ten outputs to the FLA chunk_size=32 reference
+  using PyTorch's additive atol+rtol*abs(reference) criterion with
+  atol=rtol=0.01 in each output's native dtype. Every element must pass;
+  RMS error ratios are diagnostic only.
+  Repeated numerical and output-poisoning checks remain enabled. Scoring is
+  packaged baseline latency /
+  candidate latency, higher is better.
+  The default max shape mode selects only the named H96 row.

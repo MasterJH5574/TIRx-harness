@@ -1,0 +1,10 @@
+{
+  "KernelWiki": {
+    "url": "https://github.com/mit-han-lab/KernelWiki.git",
+    "revision": "76d27b56f804e7e7295d4c570e1e5d7eef4b0a75"
+  },
+  "ncu-report-skill": {
+    "url": "https://github.com/mit-han-lab/ncu-report-skill.git",
+    "revision": "d1887948c7d53690cfe6605f59c1329b8a1c6bb5"
+  }
+}

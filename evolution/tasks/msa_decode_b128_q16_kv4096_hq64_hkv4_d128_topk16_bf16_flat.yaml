@@ -1,0 +1,54 @@
+name: msa_decode_b128_q16_kv4096_hq64_hkv4_d128_topk16_bf16_flat
+workload_dir: candidates/msa/decode_b128_q16_kv4096_hq64_hkv4_d128_topk16_bf16_flat
+kernel_authoring: tirx-lite
+sota_baseline:
+  name: minimax_sparse_atten_func
+bench_timeout_s: 300
+banned_paths:
+  - tirx-kernels/tirx_kernels/msa/**
+  - tirx-kernels/tirx_kernels/ported/msa/**
+  - tirx-kernels/.agents/sketch/msa/**
+spec: |
+  Implement MiniMax sparse decode attention on B200 (sm_100) with the
+  msa_sparse_decode_attention contract. Beat the packaged baseline:
+  MiniMax fmha_sm100 sparse_atten_func.
+
+  This fixed-shape task pins the following large official row:
+  `mtp_bf16_b128_q16_kv4096_h64`.
+  B=128, seqlen_q=16, kv_len=4096 per sequence, Hq=64, Hkv=4,
+  D=128 and topk=16. q is bf16[2048,64,128], K/V are flat
+  bf16[524288,4,128], cu_seqlens_k=[0,4096,...,524288], and
+  page_table=seqused_k=None. This is uniform multi-token decode with
+  complete KV blocks and no mixed dtype or partial-page boundary.
+
+  Inputs, in order, are q, k, v, q2k_indices, cu_seqlens_k, page_table,
+  seqused_k, seqlen_q, softmax_scale. q is contiguous bf16[2048,64,128];
+  each request has seqlen_q=16. K/V are flat bf16[524288,4,128]. Output
+  has q's shape/dtype and inputs must remain unchanged.
+  q2k_indices is int32[Hkv,B*seqlen_q,topk], with ascending sequence-local
+  128-token block ids and -1 padding. cu_seqlens_k is int32[129],
+  with page_table/seqused_k=None.
+  seqlen_q is an int32 scalar and softmax_scale an fp32 scalar, officially
+  1/sqrt(128). No cu_seqlens_q input is supplied for this decode contract.
+
+  Query head h uses KV head h//(Hq/Hkv). Token i of request b is at KV
+  position kv_len[b]-seqlen_q+i; apply this bottom-right causal boundary
+  along with the selected blocks, valid KV lengths and -1 padding. Compute
+  scaled dot-product softmax attention over valid selected tokens; an empty
+  selection returns zeros.
+
+  Version contract: solution.py exports setup(data, B, seqlen_q) -> callable.
+  data contains the nine inputs above and preallocated output. setup may
+  compile, allocate scratch and shape-only metadata, and execute one warmup
+  call. Each timed call must consume current selection/length/page metadata,
+  perform data-dependent preparation, and overwrite output. The adapter
+  returns (data['output'],). Do not call FlashInfer, MiniMax MSA, PyTorch
+  tensor operators, Triton, CUTE DSL, raw CUDA, or existing solution kernels
+  for production computation.
+
+  Correctness uses an independent sparse-attention oracle with bf16 output.
+  Every element must pass PyTorch's additive atol+rtol*abs(reference)
+  criterion with atol=rtol=0.01 in the native bf16 dtype. RMS is diagnostic
+  only. Repeated numerical checks and output poisoning
+  remain enabled. The adapter scores only the selected official
+  row. Scoring is packaged baseline latency / candidate latency.

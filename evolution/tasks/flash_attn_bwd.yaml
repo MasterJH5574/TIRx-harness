@@ -1,0 +1,35 @@
+name: flash_attn_bwd
+workload_dir: candidates/flash_attn_bwd
+kernel_authoring: tirx-lite
+sota_baseline:
+  name: FA4
+banned_paths: []
+spec: |
+  Implement prepared-tensor FlashAttention-4 FP16 BACKWARD on B200 (sm_100)
+  and beat FA4's low-level backward path on GPU-only latency.
+
+  Inputs are q,k,v,out,grad_out fp16[B,S,H,128], saved natural-log LSE
+  fp32[B,H,S], causal bool, and scalar fp32 sm_scale. Reconstruct the forward
+  probabilities P = softmax(sm_scale * q @ k^T) with the causal mask when
+  requested. With D_i = dot(out_i, grad_out_i), compute
+    dP_ij = dot(grad_out_i, v_j)
+    dS_ij = sm_scale * P_ij * (dP_ij - D_i)
+    dq = dS @ k,  dk = dS^T @ q,  dv = P^T @ grad_out.
+  Reductions are fp32 conceptually and the three published outputs are fp16.
+
+  The five official shapes fix H=16 and D=128 and cover S=2048/4096/8192,
+  B=1/2, causal and non-causal modes. The causal flag is semantic: masking
+  must be applied consistently to probability reconstruction and all three
+  gradients.
+
+  Version contract: solution.py exports setup(data, B, H, S, D) -> callable.
+  data contains Q/K/V/O/dO/LSE, causal, softmax_scale, and preallocated
+  dQ/dK/dV. setup may compile, allocate scratch, and execute one complete
+  warmup call. Every timed invocation must consume the prepared inputs and
+  overwrite all three gradients; any recomputation or preprocessing required
+  by the implementation remains in the timed GPU path. Do not call FA4,
+  PyTorch tensor operators, Triton, CUTE DSL, raw CUDA, or an existing
+  solution kernel for production computation.
+
+  Correctness uses atol=0.1, rtol=0.1, and matched_ratio>=0.995 for dq/dk/dv.
+  The adapter scores all five official shapes.

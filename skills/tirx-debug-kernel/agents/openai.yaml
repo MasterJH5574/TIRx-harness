@@ -1,0 +1,4 @@
+interface:
+  display_name: "TIRx Debug Kernel"
+  short_description: "Debug and validate runnable TIRx kernels"
+  default_prompt: "Use $tirx-debug-kernel to execute the applicable correctness diagnostics on this runnable TIRx kernel and report evidence."

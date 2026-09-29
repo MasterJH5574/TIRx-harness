@@ -1,0 +1,37 @@
+{
+  "classes": {
+    "integer": ["scalar", "cast", "buffer", "reinterpret_raw", "integer", "predicate"],
+    "boolean": ["scalar", "cast", "buffer", "predicate"],
+    "scalar": ["scalar", "cast", "buffer"],
+    "scalar_raw": ["scalar", "cast", "buffer", "reinterpret_raw"],
+    "cast": ["cast", "buffer"],
+    "buffer": ["buffer"],
+    "storage": []
+  },
+  "types": {
+    "bool": {"bits": 8, "class": "boolean"},
+    "int8": {"bits": 8, "class": "integer"},
+    "uint8": {"bits": 8, "class": "integer"},
+    "float8_e3m4": {"bits": 8, "class": "storage"},
+    "float8_e4m3": {"bits": 8, "class": "storage"},
+    "float8_e4m3b11fnuz": {"bits": 8, "class": "storage"},
+    "float8_e4m3fn": {"bits": 8, "class": "cast"},
+    "float8_e4m3fnuz": {"bits": 8, "class": "storage"},
+    "float8_e5m2": {"bits": 8, "class": "storage"},
+    "float8_e5m2fnuz": {"bits": 8, "class": "storage"},
+    "float8_e8m0fnu": {"bits": 8, "class": "cast"},
+    "int16": {"bits": 16, "class": "integer"},
+    "uint16": {"bits": 16, "class": "integer"},
+    "float16": {"bits": 16, "class": "scalar"},
+    "bfloat16": {"bits": 16, "class": "scalar"},
+    "int32": {"bits": 32, "class": "integer"},
+    "uint32": {"bits": 32, "class": "integer"},
+    "float32": {"bits": 32, "class": "scalar_raw"},
+    "int64": {"bits": 64, "class": "integer"},
+    "uint64": {"bits": 64, "class": "integer"},
+    "float64": {"bits": 64, "class": "scalar_raw"},
+    "int128": {"bits": 128, "class": "buffer"},
+    "uint128": {"bits": 128, "class": "buffer"},
+    "float4_e2m1fn": {"bits": 4, "class": "cast"}
+  }
+}

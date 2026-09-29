@@ -1,0 +1,4 @@
+interface:
+  display_name: "TIRx Wiki"
+  short_description: "Authoritative TIRx APIs, kernels, optimization, and GPU references"
+  default_prompt: "Use $tirx-wiki for TIRx API, kernel-construction, optimization, or GPU-reference questions; highlight canonical kernels and the PTX ISA manual when relevant, and use the other reference sources as appropriate."

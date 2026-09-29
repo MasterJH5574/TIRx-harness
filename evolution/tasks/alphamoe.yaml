@@ -1,0 +1,61 @@
+name: alphamoe
+workload_dir: candidates/alphamoe
+kernel_authoring: tirx-lite
+sota_baseline:
+  name: trtllm_fp8_block_scale_routed_moe
+bench_timeout_s: 300
+banned_paths:
+  - tirx-kernels/tirx_kernels/moe/**
+  - tirx-kernels/tirx_kernels/ported/flashinfer/fused_moe/**
+  - tirx-kernels/.agents/sketch/blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_rubin.md
+spec: |
+  Implement the Alpha-MoE layer from bf16 activations and preselected routes
+  on B200 (sm_100), using the Qwen3-Next TP4 contract.
+  Beat the packaged FlashInfer TensorRT-LLM block-scale routed MoE baseline,
+  including activation quantization and route processing in the timed call.
+
+  The six official rows have M in {1,8,16,32,64,128}, hidden size K=2048,
+  intermediate size I=128, E=512 experts, and top_k=10. Inputs are:
+    hidden_states bf16[M,K], topk_ids int32[M,top_k],
+    topk_weights fp32[M,top_k],
+    gemm1_weights fp8_e4m3fn[E,2*I,K],
+    gemm1_weights_scale fp32[E,2*I/128,K/128],
+    gemm2_weights fp8_e4m3fn[E,K,I],
+    gemm2_weights_scale fp32[E,K/128,I/128],
+    top_k int32 scalar, routed_scaling_factor fp32 scalar.
+  Output is output bf16[M,K]. Weight scales cover 128x128 blocks.
+
+  Use the supplied topk_ids and their paired fp32 topk_weights in the given
+  route order; do not recompute or renormalize them. Quantize
+  hidden_states per token in groups of 128: scale=max(max(abs(x)),1e-8)/448,
+  quantized=fp8_e4m3fn(clamp(x/scale,-448,448)). Each selected expert computes
+  gate_up = dequantized_hidden @ dequantized_gemm1_weights.T, with rows
+  stacked [gate; up], then silu(gate)*up. Requantize that intermediate with
+  the same group-128 rule before the down projection. For each group of 128
+  intermediate channels, multiply its down-projection contribution by the
+  supplied route weight and routed_scaling_factor, round to bf16, and
+  add to a zero-initialized bf16 accumulator, rounding each update to bf16.
+  The official rows have no shared experts.
+
+  Version contract: solution.py exports setup(data, M) -> callable. data
+  contains the nine inputs above and preallocated output. Activation scales
+  and expert alignment plans are not supplied. setup may
+  compile, allocate scratch and shape-only metadata, and execute one warmup
+  call. Each timed call must redo all data-dependent quantization, expert
+  alignment, both projections, activation and accumulation, and overwrite
+  output.
+  Do not call FlashInfer, PyTorch tensor operators, Triton, CUTE DSL, raw CUDA,
+  or existing solution kernels for production computation.
+
+  Correctness uses an independent oracle that quantizes hidden_states itself,
+  with the bf16 rounding above.
+  Let abs_sum be the sum of absolute rounded contributions per output element.
+  Every element must satisfy
+    abs(candidate-ref) <= max(0.1+0.1*abs(ref), 2*abs_sum*2**-7),
+  at every contribution count. RMS is diagnostic only; partial matches are
+  not accepted. The TRT-LLM timing baseline fails this gate
+  on all six official rows; its output does not define correctness.
+  Repeated numerical and output-poisoning checks remain enabled. The adapter
+  scores
+  all six official rows. Scoring is packaged baseline latency / candidate
+  latency, higher is better.

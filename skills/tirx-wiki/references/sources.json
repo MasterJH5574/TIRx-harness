@@ -1,0 +1,51 @@
+{
+  "manuals": {
+    "cuda_programming_guide": {
+      "title": "CUDA Programming Guide",
+      "url": "https://docs.nvidia.com/cuda/cuda-programming-guide/index.html",
+      "linked_pages": true
+    },
+    "ptx_isa": {
+      "title": "Parallel Thread Execution ISA",
+      "url": "https://docs.nvidia.com/cuda/parallel-thread-execution/index.html"
+    },
+    "ncu_cli_reference": {
+      "title": "Nsight Compute CLI Reference",
+      "url": "https://docs.nvidia.com/nsight-compute/NsightComputeCli/index.html"
+    },
+    "ncu_profiling_guide": {
+      "title": "Nsight Compute Profiling Guide",
+      "url": "https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html"
+    }
+  },
+  "repositories": {
+    "tirx-kernels": {
+      "title": "TIRx Kernels",
+      "url": "https://github.com/mlc-ai/tirx-kernels.git"
+    },
+    "cutlass": {
+      "title": "CUTLASS",
+      "url": "https://github.com/NVIDIA/cutlass.git"
+    },
+    "deep-gemm": {
+      "title": "DeepGEMM",
+      "url": "https://github.com/deepseek-ai/DeepGEMM.git"
+    },
+    "flash-attention": {
+      "title": "FlashAttention",
+      "url": "https://github.com/Dao-AILab/flash-attention.git"
+    },
+    "flash-linear-attention": {
+      "title": "Flash Linear Attention",
+      "url": "https://github.com/fla-org/flash-linear-attention.git"
+    },
+    "flashinfer": {
+      "title": "FlashInfer",
+      "url": "https://github.com/flashinfer-ai/flashinfer.git"
+    },
+    "flashkda": {
+      "title": "FlashKDA",
+      "url": "https://github.com/MoonshotAI/FlashKDA.git"
+    }
+  }
+}

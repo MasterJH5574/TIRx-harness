@@ -1,0 +1,205 @@
+{
+  "name": "kda_decode_recurrent_d128_h16_bf16",
+  "description": "Recurrent Kimi Delta Attention decode with the flashinfer.kda_decode.recurrent_kda contract (flashinfer PR #4279): bf16 D=128 q/k/v, log-space or raw per-key-channel gate, pre-sigmoided beta, in-kernel q/k L2 norm, GVA (HV % H == 0), and a v-first bf16 state pool. T=1 rows use the standard [N, 1, ...] decode layout; T>=2 rows use packed speculative decode ([1, N*T, ...] with cu_seqlens, per-token checkpoint slots via ssm_state_indices and num_accepted_tokens); T=3 rows use the lower-bound gate (raw g with fp32 A_log/dt_bias, lower_bound=-5). The returned state pool is a new tensor holding the written checkpoints. Workloads are the PR's 30-row matrix: five sequence counts per token count.",
+  "op_type": "kda",
+  "tags": [
+    "status:synthetic",
+    "stage:decode",
+    "dtype:bfloat16",
+    "model:kimi-k2.5",
+    "layout:v-first-state",
+    "kernel:recurrent-kda"
+  ],
+  "axes": {
+    "num_tokens": {
+      "type": "var",
+      "description": "Tokens per sequence (T = 1 + num_spec_tokens)."
+    },
+    "num_seqs": {
+      "type": "var",
+      "description": "Sequences per call (N)."
+    },
+    "num_qk_heads": {
+      "type": "const",
+      "value": 16,
+      "description": "Query/key heads (H)."
+    },
+    "num_v_heads": {
+      "type": "var",
+      "description": "Value heads (HV); HV % H == 0."
+    },
+    "head_dim": {
+      "type": "const",
+      "value": 128,
+      "description": "Key and value head dimension."
+    },
+    "gate_dim": {
+      "type": "var",
+      "description": "num_qk_heads * head_dim (dt_bias length)."
+    },
+    "token_batch": {
+      "type": "var",
+      "description": "Leading q/k/v dim: N for standard decode, 1 for packed spec decode."
+    },
+    "token_len": {
+      "type": "var",
+      "description": "Second q/k/v dim: 1 for standard decode, N*T for packed spec decode."
+    },
+    "num_spec_tokens": {
+      "type": "var",
+      "description": "T - 1 (0 for standard decode)."
+    },
+    "num_state_slots": {
+      "type": "var",
+      "description": "State pool slots: N for standard decode, N*T + 6 for spec decode."
+    },
+    "cu_seqlens_len": {
+      "type": "var",
+      "description": "N + 1 for spec decode, 0 (absent) for standard decode."
+    },
+    "lower_bound_gate": {
+      "type": "var",
+      "description": "1 on lower-bound gate rows (raw g, A_log, dt_bias), else 0."
+    }
+  },
+  "constraints": [
+    "num_v_heads % num_qk_heads == 0",
+    "num_tokens == 1 implies cu_seqlens, ssm_state_indices, num_spec_tokens, num_accepted_tokens are None",
+    "num_tokens >= 2 implies num_spec_tokens == num_tokens - 1",
+    "lower_bound_gate == 0 implies A_log, dt_bias, lower_bound are None",
+    "q.dtype == k.dtype == v.dtype == g.dtype == beta.dtype == initial_state.dtype == torch.bfloat16"
+  ],
+  "inputs": {
+    "q": {
+      "shape": [
+        "token_batch",
+        "token_len",
+        "num_qk_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Raw queries; L2-normalized in-kernel."
+    },
+    "k": {
+      "shape": [
+        "token_batch",
+        "token_len",
+        "num_qk_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Raw keys; L2-normalized in-kernel."
+    },
+    "v": {
+      "shape": [
+        "token_batch",
+        "token_len",
+        "num_v_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "g": {
+      "shape": [
+        "token_batch",
+        "token_len",
+        "num_v_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Per-key-channel gate: log-space on precomputed rows, raw on lower-bound rows."
+    },
+    "beta": {
+      "shape": [
+        "token_batch",
+        "token_len",
+        "num_v_heads"
+      ],
+      "dtype": "bfloat16",
+      "description": "Pre-sigmoided delta-rule learning rate."
+    },
+    "A_log": {
+      "shape": [
+        "num_qk_heads"
+      ],
+      "dtype": "float32",
+      "description": "Log decay per head; None on precomputed rows."
+    },
+    "dt_bias": {
+      "shape": [
+        "gate_dim"
+      ],
+      "dtype": "float32",
+      "description": "Gate bias per head and key channel; None on precomputed rows."
+    },
+    "scale": {
+      "shape": null,
+      "dtype": "float32",
+      "description": "Query scale, 1/sqrt(head_dim)."
+    },
+    "initial_state": {
+      "shape": [
+        "num_state_slots",
+        "num_v_heads",
+        "head_dim",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "V-first state pool [slots, HV, V, K]; not modified by the call."
+    },
+    "cu_seqlens": {
+      "shape": [
+        "cu_seqlens_len"
+      ],
+      "dtype": "int32",
+      "description": "Packed sequence offsets (spec decode only)."
+    },
+    "ssm_state_indices": {
+      "shape": [
+        "num_seqs",
+        "num_tokens"
+      ],
+      "dtype": "int32",
+      "description": "Checkpoint slot per sequence and token (spec decode only)."
+    },
+    "num_spec_tokens": {
+      "shape": null,
+      "dtype": "int32",
+      "description": "T - 1 (spec decode only)."
+    },
+    "num_accepted_tokens": {
+      "shape": [
+        "num_seqs"
+      ],
+      "dtype": "int32",
+      "description": "Accepted tokens of the previous round; the start slot is ssm_state_indices[n, accepted - 1] (spec decode only)."
+    },
+    "lower_bound": {
+      "shape": null,
+      "dtype": "float32",
+      "description": "Negative gate lower bound (lower-bound rows only)."
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "token_batch",
+        "token_len",
+        "num_v_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "final_state": {
+      "shape": [
+        "num_state_slots",
+        "num_v_heads",
+        "head_dim",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "New state pool: written checkpoint slots, all other slots equal to initial_state."
+    }
+  },
+  "reference": "import torch\n\n\n@torch.no_grad()\ndef run(\n    q: torch.Tensor,\n    k: torch.Tensor,\n    v: torch.Tensor,\n    g: torch.Tensor,\n    beta: torch.Tensor,\n    A_log,\n    dt_bias,\n    scale: float,\n    initial_state: torch.Tensor,\n    cu_seqlens,\n    ssm_state_indices,\n    num_spec_tokens,\n    num_accepted_tokens,\n    lower_bound,\n):\n    \"\"\"\n    Recurrent KDA decode (flashinfer.kda_decode.recurrent_kda semantics) in\n    fp32, one sequence and one token at a time:\n\n    \u2022 q/k are L2-normalized along the head dimension in-kernel, q scaled by\n      ``scale``; value head hv uses q/k head hv // (HV // H) (GVA).\n    \u2022 gate: precomputed rows pass log-space g (decay = exp(g)); lower-bound\n      rows pass raw g with fp32 A_log[H] / dt_bias[H*K] and\n      decay = exp(lower_bound * sigmoid(exp(A_log) * (g + dt_bias))).\n    \u2022 per token, with S the [K, V] state of one value head:\n          S = S * decay[:, None]; S += beta * outer(k, v - k @ S); o = q @ S\n    \u2022 standard decode (cu_seqlens is None): q [N, 1, H, K]; sequence n reads\n      and writes state slot n.\n    \u2022 speculative decode: packed q [1, N*T, H, K] with T = 1 + num_spec_tokens\n      tokens per sequence (cu_seqlens); sequence n starts from slot\n      ssm_state_indices[n, num_accepted_tokens[n] - 1] and writes the state\n      after token t to slot ssm_state_indices[n, t]; other slots are untouched.\n    \u2022 the state pool is v-first bf16 [slots, HV, V, K]; the returned pool is a\n      new tensor (the input pool is not modified).\n    \"\"\"\n\n    num_qk_heads, head_dim = q.shape[-2], q.shape[-1]\n    num_v_heads = v.shape[-2]\n    group = num_v_heads // num_qk_heads\n    standard = cu_seqlens is None\n    if standard:\n        num_seqs, num_tokens = q.shape[0], 1\n    else:\n        num_seqs = int(cu_seqlens.numel()) - 1\n        num_tokens = int(num_spec_tokens) + 1\n\n    def normalize(x):\n        return x * torch.rsqrt(x.square().sum(-1, keepdim=True) + 1e-6)\n\n    qf = normalize(q.float()).reshape(num_seqs, num_tokens, num_qk_heads, head_dim) * float(scale)\n    kf = normalize(k.float()).reshape(num_seqs, num_tokens, num_qk_heads, head_dim)\n    vf = v.float().reshape(num_seqs, num_tokens, num_v_heads, head_dim)\n    bf = beta.float().reshape(num_seqs, num_tokens, num_v_heads)\n    gf = g.float().reshape(num_seqs, num_tokens, num_v_heads, head_dim)\n    if A_log is not None:\n        head_of_v = torch.arange(num_v_heads, device=q.device) // group\n        a = A_log.float().exp()[head_of_v]  # [HV]\n        bias = dt_bias.float().view(num_qk_heads, head_dim)[head_of_v]  # [HV, K]\n        gf = float(lower_bound) * torch.sigmoid(a[:, None] * (gf + bias))\n    decay = gf.exp()\n\n    output = torch.empty_like(v, dtype=torch.float32)\n    output_view = output.reshape(num_seqs, num_tokens, num_v_heads, head_dim)\n    pool = initial_state.clone()\n    if not standard:\n        indices = ssm_state_indices.to(torch.int64).cpu()\n        accepted = (\n            torch.ones(num_seqs, dtype=torch.int64)\n            if num_accepted_tokens is None\n            else num_accepted_tokens.to(torch.int64).cpu().clamp(1, num_tokens)\n        )\n    for n in range(num_seqs):\n        if standard:\n            start_slot = n\n        else:\n            start_slot = int(indices[n, accepted[n] - 1])\n        # k-first fp32 working state [HV, K, V] from the v-first bf16 slot.\n        S = pool[start_slot].float().transpose(-1, -2).clone()\n        for t in range(num_tokens):\n            q_t = qf[n, t].repeat_interleave(group, dim=0)  # [HV, K]\n            k_t = kf[n, t].repeat_interleave(group, dim=0)\n            v_t, b_t = vf[n, t], bf[n, t]\n            S = S * decay[n, t][:, :, None]\n            kS = torch.einsum(\"hk,hkv->hv\", k_t, S)\n            S = S + torch.einsum(\"hk,hv->hkv\", b_t[:, None] * k_t, v_t - kS)\n            output_view[n, t] = torch.einsum(\"hk,hkv->hv\", q_t, S)\n            slot = n if standard else int(indices[n, t])\n            pool[slot] = S.transpose(-1, -2).to(pool.dtype)\n    return output.to(v.dtype), pool\n"
+}

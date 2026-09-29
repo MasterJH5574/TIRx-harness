@@ -1,0 +1,3 @@
+[submodule "thirdparty/tvm-rust-ext"]
+	path = thirdparty/tvm-rust-ext
+	url = https://github.com/mlc-ai/tvm-rust-ext.git

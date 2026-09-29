@@ -1,0 +1,1 @@
+{"definition":"wan_hybrid_attention_b1_s4800_h40_d128_bf16","solution":null,"workload":{"uuid":"wan-hybrid-attention-b1-s4800-h40-d128-bf16-noncausal","axes":{"batch_size":1,"seq_len":4800,"num_heads":40,"head_dim":128},"inputs":{"q":{"type":"random"},"k":{"type":"random"},"v":{"type":"random"},"sm_scale":{"type":"scalar","value":0.08838834764831845}}},"evaluation":null}

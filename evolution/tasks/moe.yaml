@@ -1,0 +1,46 @@
+name: moe
+workload_dir: candidates/moe
+kernel_authoring: tirx-lite
+sota_baseline:
+  name: trtllm_fp8_block_scale_moe
+banned_paths:
+  - tirx-kernels/tirx_kernels/moe/**
+  - tirx-kernels/tirx_kernels/ported/flashinfer/fused_moe/**
+  - tirx-kernels/.agents/sketch/blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion_rubin.md
+spec: |
+  Implement DeepSeek-V3/R1 FP8 block-scale Mixture-of-Experts on B200
+  (sm_100) and beat flashinfer.fused_moe.trtllm_fp8_block_scale_moe.
+
+  Geometry is fixed: 256 global experts, 32 local experts, hidden size 7168,
+  intermediate size 2048, FP8 E4M3 block size 128, top_k=8, n_group=8, and
+  topk_group=4. For each token, form s=sigmoid(routing_logits); add
+  routing_bias only for selection; score each 32-expert group by its largest
+  two biased scores; keep four groups; then select the largest eight experts
+  among them. Normalize the selected unbiased s values, multiply by
+  routed_scaling_factor, and compute only experts in
+  [local_expert_offset, local_expert_offset+32).
+
+  For each selected local expert, dequantize the FP8 hidden row and W13/W2
+  with their 128-wide block scales, compute G1 = hidden @ W13^T, activation
+  silu(G1[:,2048:]) * G1[:,:2048], then the W2 down projection. Accumulate
+  expert results in fp32 using the route weights and cast the final output to
+  bf16.
+
+  Inputs: routing_logits fp32[T,256], routing_bias bf16[256], hidden_states
+  fp8[T,7168], hidden_states_scale fp32[56,T], gemm1_weights
+  fp8[32,4096,7168], gemm1_weights_scale fp32[32,32,56], gemm2_weights
+  fp8[32,7168,2048], gemm2_weights_scale fp32[32,56,16], scalar int32
+  local_expert_offset, and scalar fp32 routed_scaling_factor. Output is
+  bf16[T,7168].
+
+  Version contract: solution.py exports setup(data, T) -> callable using the
+  exact input names above plus preallocated output. setup may compile,
+  allocate shape-only metadata/scratch, and execute one warmup call. Every
+  timed invocation must redo routing, both grouped GEMMs, activation, and
+  accumulation from current inputs and overwrite output. Do not call
+  FlashInfer, PyTorch tensor operators, Triton, CUTE DSL, raw CUDA, or an
+  existing solution kernel for production computation.
+
+  Correctness uses atol=1.0, rtol=0.3, and matched_ratio>=0.9. The 19 official
+  trace rows span T=1..14107; the adapter scores all of them plus the T=32768
+  synthetic stress row.

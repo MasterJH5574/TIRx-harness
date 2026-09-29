@@ -1,0 +1,266 @@
+{
+  "name": "kda_backward_k128_v128_bf16",
+  "description": "Kimi K3 Delta Attention training step from the raw layer inputs, the boundary flashinfer PR #4636 benchmarks against FLA's full DAG: bf16 q/k/v, raw gate input g, raw beta logits, fp32 A_log and dt_bias, per-sequence v-first fp32 initial state, cu_seqlens of the packed variable-length sequences, and the upstream gradients of the output and final state. q/k are L2-normalized, beta = sigmoid(beta), the per-key decay is lower_bound * sigmoid(exp(A_log) * (g + dt_bias)) with lower_bound = -5, and GVA repeats each q/k head over num_v_heads / num_qk_heads value heads. Each timed call runs the forward recurrence and the backward pass and returns the output, the final state and the gradients of q, k, v, g, beta, A_log, dt_bias and initial_state.",
+  "op_type": "kda",
+  "tags": [
+    "stage:backward",
+    "timing:forward-and-backward",
+    "dtype:bfloat16",
+    "model:kimi-k3",
+    "layout:packed-varlen",
+    "layout:v-first-state",
+    "inputs:raw-layer",
+    "status:synthetic",
+    "kernel:chunk-kda"
+  ],
+  "axes": {
+    "batch_size": {
+      "type": "const",
+      "value": 1,
+      "description": "Packed layout: one physical batch."
+    },
+    "total_tokens": {
+      "type": "var",
+      "description": "Tokens of all packed sequences."
+    },
+    "num_seqs": {
+      "type": "var",
+      "description": "Packed sequences (cu_seqlens has num_seqs + 1 entries)."
+    },
+    "len_cu_seqlens": {
+      "type": "var",
+      "description": "num_seqs + 1."
+    },
+    "num_qk_heads": {
+      "type": "var",
+      "description": "Query/key head count."
+    },
+    "num_v_heads": {
+      "type": "var",
+      "description": "Value, gate and beta head count; a multiple of num_qk_heads."
+    },
+    "key_head_dim": {
+      "type": "const",
+      "value": 128
+    },
+    "value_head_dim": {
+      "type": "const",
+      "value": 128
+    },
+    "gate_dim": {
+      "type": "var",
+      "description": "num_v_heads * key_head_dim, the flat dt_bias length."
+    },
+    "seed": {
+      "type": "var",
+      "description": "torch.Generator seed of the row's inputs (PR #4636's per-shape seed)."
+    }
+  },
+  "constraints": [
+    "batch_size == 1",
+    "num_v_heads % num_qk_heads == 0",
+    "len_cu_seqlens == num_seqs + 1",
+    "sum(sequence lengths) == total_tokens",
+    "gate_dim == num_v_heads * key_head_dim",
+    "q.shape == k.shape",
+    "v.shape == g.shape == do.shape",
+    "initial_state.shape == dfinal_state.shape",
+    "q.dtype == torch.bfloat16",
+    "A_log.dtype == dt_bias.dtype == initial_state.dtype == torch.float32"
+  ],
+  "inputs": {
+    "q": {
+      "shape": [
+        "batch_size",
+        "total_tokens",
+        "num_qk_heads",
+        "key_head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Raw queries; L2-normalized inside the layer."
+    },
+    "k": {
+      "shape": [
+        "batch_size",
+        "total_tokens",
+        "num_qk_heads",
+        "key_head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Raw keys; L2-normalized inside the layer."
+    },
+    "v": {
+      "shape": [
+        "batch_size",
+        "total_tokens",
+        "num_v_heads",
+        "value_head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "g": {
+      "shape": [
+        "batch_size",
+        "total_tokens",
+        "num_v_heads",
+        "key_head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Raw per-key-channel gate input before dt_bias and the lower-bounded sigmoid."
+    },
+    "beta": {
+      "shape": [
+        "batch_size",
+        "total_tokens",
+        "num_v_heads"
+      ],
+      "dtype": "bfloat16",
+      "description": "Raw delta-update gate logits; sigmoid inside the layer."
+    },
+    "A_log": {
+      "shape": [
+        "num_v_heads"
+      ],
+      "dtype": "float32",
+      "description": "Per-head log decay rate."
+    },
+    "dt_bias": {
+      "shape": [
+        "gate_dim"
+      ],
+      "dtype": "float32",
+      "description": "Per-(head, key channel) gate bias, flattened."
+    },
+    "scale": {
+      "shape": null,
+      "dtype": "float32",
+      "description": "Query/state contraction scale."
+    },
+    "initial_state": {
+      "shape": [
+        "num_seqs",
+        "num_v_heads",
+        "value_head_dim",
+        "key_head_dim"
+      ],
+      "dtype": "float32",
+      "description": "V-first recurrent state at the start of each sequence."
+    },
+    "cu_seqlens": {
+      "shape": [
+        "len_cu_seqlens"
+      ],
+      "dtype": "int64",
+      "description": "Packed sequence offsets (0, cumsum of lengths); None for a single sequence."
+    },
+    "do": {
+      "shape": [
+        "batch_size",
+        "total_tokens",
+        "num_v_heads",
+        "value_head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Upstream gradient of the output."
+    },
+    "dfinal_state": {
+      "shape": [
+        "num_seqs",
+        "num_v_heads",
+        "value_head_dim",
+        "key_head_dim"
+      ],
+      "dtype": "float32",
+      "description": "Upstream gradient of the final recurrent state."
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "batch_size",
+        "total_tokens",
+        "num_v_heads",
+        "value_head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "final_state": {
+      "shape": [
+        "num_seqs",
+        "num_v_heads",
+        "value_head_dim",
+        "key_head_dim"
+      ],
+      "dtype": "float32",
+      "description": "V-first recurrent state after the last token of each sequence."
+    },
+    "dq": {
+      "shape": [
+        "batch_size",
+        "total_tokens",
+        "num_qk_heads",
+        "key_head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "dk": {
+      "shape": [
+        "batch_size",
+        "total_tokens",
+        "num_qk_heads",
+        "key_head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "dv": {
+      "shape": [
+        "batch_size",
+        "total_tokens",
+        "num_v_heads",
+        "value_head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "dg": {
+      "shape": [
+        "batch_size",
+        "total_tokens",
+        "num_v_heads",
+        "key_head_dim"
+      ],
+      "dtype": "bfloat16",
+      "description": "Gradient with respect to the raw gate input."
+    },
+    "dbeta": {
+      "shape": [
+        "batch_size",
+        "total_tokens",
+        "num_v_heads"
+      ],
+      "dtype": "bfloat16",
+      "description": "Gradient with respect to the raw beta logits."
+    },
+    "dA_log": {
+      "shape": [
+        "num_v_heads"
+      ],
+      "dtype": "float32"
+    },
+    "ddt_bias": {
+      "shape": [
+        "gate_dim"
+      ],
+      "dtype": "float32"
+    },
+    "dinitial_state": {
+      "shape": [
+        "num_seqs",
+        "num_v_heads",
+        "value_head_dim",
+        "key_head_dim"
+      ],
+      "dtype": "float32"
+    }
+  },
+  "reference": "import torch\nimport torch.nn.functional as F\nfrom torch.utils.checkpoint import checkpoint\n\nLOWER_BOUND = -5.0\nL2NORM_EPS = 1e-6\nSTEPS_PER_BLOCK = 64\n\n\ndef _l2norm(x):\n    return x * torch.rsqrt(x.square().sum(-1, keepdim=True) + L2NORM_EPS)\n\n\ndef _pad_sequences(x, cu_seqlens, max_len):\n    \"\"\"[1, T, ...] packed -> [N, max_len, ...] zero-padded (differentiable).\"\"\"\n\n    num_seqs = cu_seqlens.numel() - 1\n    lens = cu_seqlens[1:] - cu_seqlens[:-1]\n    padded = x.new_zeros((num_seqs, max_len) + tuple(x.shape[2:]))\n    for i in range(num_seqs):\n        padded[i, : lens[i]] = x[0, cu_seqlens[i] : cu_seqlens[i + 1]]\n    return padded\n\n\ndef _unpad_sequences(padded, cu_seqlens):\n    return torch.cat(\n        [padded[i, : cu_seqlens[i + 1] - cu_seqlens[i]] for i in range(cu_seqlens.numel() - 1)],\n        dim=0,\n    ).unsqueeze(0)\n\n\ndef _recurrence_block(S, q, k, v, g, beta, active):\n    \"\"\"Run STEPS_PER_BLOCK tokens of the delta rule on all sequences at once.\n\n    S: [N, HV, K, V]; q/k/g: [steps, N, HV, K]; v: [steps, N, HV, V];\n    beta: [steps, N, HV]; active: [steps, N] (False past a sequence's end).\n    \"\"\"\n\n    outputs = []\n    for t in range(q.shape[0]):\n        decayed = S * torch.exp(g[t])[..., :, None]\n        predicted = torch.einsum(\"nhk,nhkv->nhv\", k[t], decayed)\n        update = torch.einsum(\"nhk,nhv->nhkv\", beta[t][..., None] * k[t], v[t] - predicted)\n        new_state = decayed + update\n        S = torch.where(active[t][:, None, None, None], new_state, S)\n        outputs.append(torch.einsum(\"nhk,nhkv->nhv\", q[t], S))\n    return S, torch.stack(outputs)\n\n\ndef _forward(q, k, v, g, beta, A_log, dt_bias, scale, initial_state, cu_seqlens):\n    \"\"\"fp32 recurrent KDA forward: (output [1, T, HV, V], final_state [N, HV, V, K]).\"\"\"\n\n    _, total_tokens, num_qk_heads, key_dim = q.shape\n    num_v_heads = v.shape[2]\n    groups = num_v_heads // num_qk_heads\n    if cu_seqlens is None:\n        cu_seqlens = torch.tensor([0, total_tokens], dtype=torch.int64, device=q.device)\n    lens = cu_seqlens[1:] - cu_seqlens[:-1]\n    max_len = int(lens.max())\n\n    q = _l2norm(q.float()).repeat_interleave(groups, dim=2) * float(scale)\n    k = _l2norm(k.float()).repeat_interleave(groups, dim=2)\n    v = v.float()\n    gate = LOWER_BOUND * torch.sigmoid(\n        torch.exp(A_log.float())[None, None, :, None]\n        * (g.float() + dt_bias.float().view(num_v_heads, key_dim))\n    )\n    beta = torch.sigmoid(beta.float())\n\n    q, k, v, gate, beta = (\n        _pad_sequences(x, cu_seqlens, max_len).transpose(0, 1) for x in (q, k, v, gate, beta)\n    )  # [max_len, N, ...]\n    active = torch.arange(max_len, device=q.device)[:, None] < lens[None, :]\n\n    S = initial_state.float().transpose(-1, -2)  # v-first [N, HV, V, K] -> [N, HV, K, V]\n    outputs = []\n    for start in range(0, max_len, STEPS_PER_BLOCK):\n        block = slice(start, min(start + STEPS_PER_BLOCK, max_len))\n        S, o = checkpoint(\n            _recurrence_block,\n            S, q[block], k[block], v[block], gate[block], beta[block], active[block],\n            use_reentrant=False,\n        )\n        outputs.append(o)\n    output = _unpad_sequences(torch.cat(outputs).transpose(0, 1), cu_seqlens)\n    return output, S.transpose(-1, -2)\n\n\ndef run(q, k, v, g, beta, A_log, dt_bias, scale, initial_state, cu_seqlens, do, dfinal_state):\n    \"\"\"\n    Kimi K3 Delta Attention training step (flashinfer PR #4636's full-DAG\n    boundary), evaluated by an fp32 token-by-token recurrence with autograd:\n\n    \u2022 q, k = l2norm(q), l2norm(k); each q/k head serves num_v_heads / num_qk_heads\n      value heads (GVA).\n    \u2022 decay g = lower_bound * sigmoid(exp(A_log) * (g + dt_bias)), lower_bound = -5\n      (log-space, per key channel); beta = sigmoid(beta).\n    \u2022 per token t of each sequence, with S_0 = initial_state (v-first layout):\n        S_t = S_{t-1} * exp(g_t)      (per key row)\n        S_t = S_t + beta_t * k_t (v_t - k_t^T S_t)^T\n        o_t = scale * q_t^T S_t\n    \u2022 output = o (bf16), final_state = S_T (fp32, v-first);\n      the gradients of (output, final_state) with upstream (do, dfinal_state)\n      with respect to q, k, v, g, beta, A_log, dt_bias and initial_state follow\n      by autograd, in each input's dtype.\n    \"\"\"\n\n    leaves = tuple(\n        t.detach().requires_grad_(True)\n        for t in (q, k, v, g, beta, A_log, dt_bias, initial_state)\n    )\n    with torch.enable_grad():\n        output, final_state = _forward(*leaves[:5], leaves[5], leaves[6], scale, leaves[7], cu_seqlens)\n        grads = torch.autograd.grad(\n            (output, final_state), leaves, grad_outputs=(do.float(), dfinal_state.float())\n        )\n    return (output.detach().to(q.dtype), final_state.detach(), *grads)\n"
+}

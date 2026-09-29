@@ -1,0 +1,146 @@
+[build-system]
+requires = ["setuptools>=64", "setuptools-scm>=8", "apache-tvm-ffi==0.1.14.post0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tirx-harness"
+dynamic = ["version", "dependencies"]
+description = "TIRx kernel development, inspection, and simulation tools"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+
+[project.urls]
+Homepage = "https://tirxharness.mlc.ai"
+Repository = "https://github.com/mlc-ai/TIRx-harness"
+
+[project.optional-dependencies]
+test = ["pytest>=8", "pytest-xdist>=3", "setuptools>=64", "pip>=25.1", "ml-dtypes"]
+
+[dependency-groups]
+# Shared compiler/runtime requirements. Keep both installation groups standalone.
+common = [
+  "apache-tvm==0.27.0",
+  "apache-tvm-ffi==0.1.14.post0",
+  "numpy>=2.5.3",
+  "nvidia-cutlass-dsl[cu13]==4.7.0",
+  # The TVM IKET profile checks these exact versions.
+  "nvidia-cuda-nvrtc==13.2.78",
+  "nvidia-cuda-nvdisasm==13.3.73",
+  "tirx-kernels>=0.1.2",
+  "kcoral>=0.1.0",
+]
+# setup.py also publishes this group as the package's default dependencies.
+harness = [
+  { include-group = "common" },
+  "pypandoc-binary>=1.17",
+  "pyyaml>=6.0.3",
+  "threadpoolctl>=3.6,<4",
+]
+benchmark = [
+  { include-group = "common" },
+  "cupti-python==13.2.0",
+  # FlashKDA 7afb9f4, built with Torch 2.13.0+cu132 for B200 (sm_100a).
+  "flash-kda @ https://raw.githubusercontent.com/mlc-ai/package/719a9830cc5cb32449df0bfcfbadc0f57fa268d1/flash_kda-0.0.1%2B7afb9f4-cp312-cp312-linux_x86_64.whl#sha256=49e5df1697459d61ee3954b22a47d37d0b117b31f0b6e0b177cee5d99e8e3393 ; python_version == '3.12'",
+  "flash-kda @ https://raw.githubusercontent.com/mlc-ai/package/719a9830cc5cb32449df0bfcfbadc0f57fa268d1/flash_kda-0.0.1%2B7afb9f4-cp313-cp313-linux_x86_64.whl#sha256=6f9b4dc2a2817e7bf06f62f9c2433596d2c036309e4caab2fa8065fee33ba26c ; python_version == '3.13'",
+  "flash-linear-attention==0.5.2",
+  "flashinfer-python @ https://github.com/flashinfer-ai/whl/releases/download/nightly-v0.6.18-20260909/flashinfer_python-0.6.18.dev20260909-py3-none-any.whl#sha256=02b1c431a1f5c1dc6ad0bfdc490261a07a8a0b71ffb12767f4e34e6113c33142",
+  "safetensors==0.8.0",
+  "torch @ https://download.pytorch.org/whl/cu132/torch-2.14.0%2Bcu132-cp312-cp312-manylinux_2_28_x86_64.whl#sha256=0b059371a41b7c868589b00ff60a9f72118bc9b3c0bf12e820c06eb2a3aab55b ; python_version == '3.12'",
+  "torch @ https://download.pytorch.org/whl/cu132/torch-2.14.0%2Bcu132-cp313-cp313-manylinux_2_28_x86_64.whl#sha256=c083c08cf72c207fefbd8bfca4935f8830af38cb1c6b9548bd589939b73f56c4 ; python_version == '3.13'",
+  "torch-c-dlpack-ext==0.1.5",
+  "triton==3.8.0",
+]
+server = [
+  { include-group = "benchmark" },
+  "kcoral[server]",
+]
+
+[tool.uv]
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
+default-groups = ["harness"]
+no-build-package = ["kcoral", "tirx-kernels"]
+
+[tool.setuptools.packages.find]
+where = ["tirx_harness/src"]
+include = ["tirx_harness*"]
+
+[tool.setuptools_scm]
+
+[tool.pytest.ini_options]
+# Repo-relative paths added to sys.path so pytest imports the repo packages
+# without requiring the user to set PYTHONPATH each time. TIR itself
+# (`tvm.tirx`) is NOT listed here — install the compatible apache-tvm and
+# apache-tvm-ffi wheels pinned above.
+# Canonical kernels come from the installed tirx-kernels package.
+pythonpath = [".", "tirx_harness/src", "tirx_harness"]
+markers = [
+  "performance: performance regression scheduled according to the requested pytest worker count",
+  "numsim_gpu: live same-kernel NumSim-vs-GPU microtest",
+]
+
+[tool.ruff]
+line-length = 100
+indent-width = 4
+target-version = "py310"
+extend-exclude = [
+  "skills/tirx-wiki/references/repos/",
+  "tirx-kernels/",
+  "evolution/benchmark/",
+  "evolution/remote/",
+]
+
+[tool.ruff.lint]
+select = [
+  "E",   # pycodestyle errors
+  "F",   # pyflakes
+  "I",   # isort
+  "UP",  # pyupgrade
+  "RUF", # ruff-specific rules
+]
+ignore = [
+  # pyupgrade (style preference or low-value)
+  "UP028", # yield-in-for-loop
+  "UP030", # format-literals
+  "UP031", # printf-string-formatting
+  # ruff (preview rules, not yet stable)
+  "RUF043", # pytest-raises-ambiguous-pattern
+  "RUF059", # unused-unpacked-variable
+]
+fixable = ["ALL"]
+unfixable = []
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["E402", "F401", "F403", "F405"]
+# Tooling contains generated source strings and compatibility-heavy parsers.
+"tirx_harness/**/*.py" = [
+  "E402",
+  "E501",
+  "E701",
+  "E702",
+  "E741",
+  "F821",
+  "F823",
+  "F841",
+  "F842",
+  "RUF001",
+  "RUF002",
+  "RUF003",
+  "RUF012",
+]
+# Only what actually fires; blanket semantic-rule waivers would mask new bugs.
+# guards.py embeds hook source as string templates.
+"evolution/preparation/**/*.py" = ["E501"]
+"evolution/setup.py" = ["E501"]
+"evolution/tests/**/*.py" = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["tvm", "tirx_kernels", "tirx_harness", "evolution"]
+split-on-trailing-comma = false
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = true
+line-ending = "auto"
+docstring-code-format = false
+docstring-code-line-length = "dynamic"
