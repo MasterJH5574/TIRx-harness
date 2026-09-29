@@ -43,7 +43,7 @@ jobs:
         run: |
           revision=$(git rev-parse HEAD:thirdparty/tvm-rust-ext)
           archive="$RUNNER_TEMP/tvm-rust-ext-${revision}.tar.gz"
-          gh release download v0.1.0rc0 --pattern "tvm-rust-ext-${revision}.tar.gz" --dir "$RUNNER_TEMP"
+          gh release download v0.1.2 --pattern "tvm-rust-ext-${revision}.tar.gz" --dir "$RUNNER_TEMP"
           echo "aef27d878f9c8510ec0070a8e5a42aa2f3c09ed8363b4449be4988bc3e4b9dd9  $archive" | sha256sum --check
           source=tirx_harness/frontend-rs/thirdparty/tvm-rust-ext
           mkdir -p "$source"
