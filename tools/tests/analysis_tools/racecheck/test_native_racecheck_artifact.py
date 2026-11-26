@@ -90,6 +90,52 @@ def native_racecheck_cta_reduce_scratch_clean(output: T.Tensor((1,), "float32"))
 
 
 @T.function
+def native_racecheck_cta_reduce_bare_scratch_waw(output: T.Tensor((1,), "float32")):
+    T.device_entry(launch=T.cuda.LaunchConfig(grid=1, block=64))
+    warp = T.cuda.warp_id()
+    lane = T.cuda.lane_id()
+    scratch = T.alloc_shared((2,), "float32")
+    if (warp == 1) and (lane == 0):
+        scratch[0] = T.float32(7)
+    reduced: T.let = T.cuda.cta_sum(T.Cast("float32", lane), 2, scratch)
+    if (warp == 0) and (lane == 0):
+        output[0] = reduced
+
+
+@T.function
+def native_racecheck_cta_reduce_bare_scratch_clean(output: T.Tensor((1,), "float32")):
+    T.device_entry(launch=T.cuda.LaunchConfig(grid=1, block=64))
+    warp = T.cuda.warp_id()
+    lane = T.cuda.lane_id()
+    scratch = T.alloc_shared((2,), "float32")
+    reduced: T.let = T.cuda.cta_sum(T.Cast("float32", warp * 32 + lane), 2, scratch)
+    if (warp == 0) and (lane == 0):
+        output[0] = reduced
+
+
+@T.function
+def native_racecheck_cta_reduce_bare_scratch_too_small(output: T.Tensor((1,), "float32")):
+    T.device_entry(launch=T.cuda.LaunchConfig(grid=1, block=64))
+    warp = T.cuda.warp_id()
+    lane = T.cuda.lane_id()
+    scratch = T.alloc_shared((1,), "float32")
+    reduced: T.let = T.cuda.cta_sum(T.Cast("float32", warp * 32 + lane), 2, scratch)
+    if (warp == 0) and (lane == 0):
+        output[0] = reduced
+
+
+@T.function
+def native_racecheck_cta_reduce_bare_local_scratch(output: T.Tensor((1,), "float32")):
+    T.device_entry(launch=T.cuda.LaunchConfig(grid=1, block=64))
+    warp = T.cuda.warp_id()
+    lane = T.cuda.lane_id()
+    scratch = T.alloc_local((2,), "float32")
+    reduced: T.let = T.cuda.cta_sum(T.Cast("float32", warp * 32 + lane), 2, scratch)
+    if (warp == 0) and (lane == 0):
+        output[0] = reduced
+
+
+@T.function
 def native_racecheck_single_warp_cta_reduce(output: T.Tensor((1,), "float32")):
     T.device_entry(launch=T.cuda.LaunchConfig(grid=1, block=32))
     lane = T.cuda.lane_id()
@@ -687,6 +733,51 @@ def test_native_racecheck_cta_reduce_internal_barriers_order_scratch_accesses(tm
     assert result.verdict == "clean"
     assert result.findings == []
     assert result.incomplete == []
+
+
+def test_native_racecheck_cta_reduce_bare_scratch_tensor_is_its_data_pointer(tmp_path):
+    # CUDA codegen passes a bare tensor as its data pointer; the checks must see
+    # the same scratch traffic as through `scratch.ptr_to([0])`.
+    raced = numsim.Engine(max_workers=1).run_racecheck_phase(
+        numsim.transpile(native_racecheck_cta_reduce_bare_scratch_waw, cache_dir=tmp_path),
+        {"output": np.zeros(1, dtype=np.float32)},
+    )
+    assert raced.verdict == "error"
+    assert raced.incomplete == []
+    assert raced.findings[-1]["access_pair"] == "write_write"
+    assert raced.findings[-1]["prior"]["space"] == "shared"
+
+    clean = numsim.Engine(max_workers=1).run_racecheck_phase(
+        numsim.transpile(native_racecheck_cta_reduce_bare_scratch_clean, cache_dir=tmp_path),
+        {"output": np.zeros(1, dtype=np.float32)},
+    )
+    assert clean.verdict == "clean"
+    assert clean.findings == []
+    assert clean.incomplete == []
+
+    numeric = numsim.Engine(max_workers=1).run(
+        numsim.transpile(
+            native_racecheck_cta_reduce_bare_scratch_clean,
+            cache_dir=tmp_path,
+            _analysis_checker=None,
+        ),
+        {"output": np.zeros(1, dtype=np.float32)},
+    )
+    assert numeric.outputs["output"][0] == np.float32(sum(range(64)))
+
+
+def test_native_racecheck_cta_reduce_bare_scratch_keeps_its_bounds_and_scope():
+    from tirx_harness import racecheck, synccheck
+
+    inputs = {"output": np.zeros(1, dtype=np.float32)}
+    for checker in (synccheck, racecheck):
+        # Two warps write partials 0 and 1 of a one-element scratch tensor.
+        small = checker(native_racecheck_cta_reduce_bare_scratch_too_small, inputs)
+        assert small.verdict == "error", small.format()
+        # A local tensor is no shared scratch: unsupported, never clean.
+        local = checker(native_racecheck_cta_reduce_bare_local_scratch, inputs)
+        assert local.verdict == "incomplete", local.format()
+        assert "must be in shared memory" in local.format()
 
 
 def test_native_racecheck_single_warp_cta_reduce_is_clean_and_numeric(tmp_path):
