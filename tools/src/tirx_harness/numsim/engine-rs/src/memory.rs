@@ -2967,6 +2967,22 @@ impl GlobalMemory {
         Ok(allocation)
     }
 
+    /// Drop the bytes of owner-private allocations whose owner is finished
+    /// with them; see `Allocation::release_private`. Unknown ids and shared
+    /// allocations are ignored.
+    pub(crate) fn release_owner_private(&self, allocations: &[AllocationId]) {
+        let released = {
+            let map = read_rwlock(&self.inner.allocations);
+            allocations
+                .iter()
+                .filter_map(|id| map.get(id).cloned())
+                .collect::<Vec<_>>()
+        };
+        for allocation in released {
+            allocation.release_private();
+        }
+    }
+
     fn next_allocation_id(&self) -> Result<AllocationId, MemoryError> {
         self.inner
             .next_allocation_id
@@ -3263,6 +3279,8 @@ struct OwnerPrivateSlot {
 impl OwnerPrivateSlot {
     /// Memory thread tokens start at 1, so 0 is never a thread's.
     const UNBOUND: u64 = 0;
+    /// The data was dropped by `release`; no thread's token.
+    const RELEASED: u64 = u64::MAX;
 
     fn new() -> Self {
         Self {
@@ -3293,6 +3311,25 @@ impl OwnerPrivateSlot {
     fn bind(&self, token: u64, data: OwnerPrivateData) {
         *self.lock() = Some(data);
         self.owner.store(token, Ordering::Release);
+    }
+
+    /// Drop the owner's data. Only the owner (`token`) can release a bound
+    /// slot; `unbound_initial` drops the initial data of a slot no thread has
+    /// bound and says whether it did. Returns whether the slot is released.
+    fn release(&self, token: u64, unbound_initial: impl FnOnce() -> bool) -> bool {
+        let owner = self.owner();
+        if owner == token {
+            self.owner.store(Self::RELEASED, Ordering::Release);
+            drop(self.lock().take());
+            return true;
+        }
+        if owner == Self::UNBOUND && unbound_initial() {
+            // `unbound_initial` took the only initial data, so no thread can
+            // bind this slot any more.
+            self.owner.store(Self::RELEASED, Ordering::Release);
+            return true;
+        }
+        false
     }
 }
 
@@ -3959,7 +3996,11 @@ impl Allocation {
             unreachable!("private backing access requires an owner-private allocation");
         };
         let token = MEMORY_THREAD_TOKEN.with(|token| *token);
-        if backing.data.owner() != token {
+        let owner = backing.data.owner();
+        if owner == OwnerPrivateSlot::RELEASED {
+            return Ok(self.with_released_private(operation));
+        }
+        if owner != token {
             // Unbound: the first thread to take the initial data owns it. A
             // thread that finds it taken is not the owner.
             let mut initial_data = lock_mutex(&backing.initial_data)
@@ -3981,7 +4022,11 @@ impl Allocation {
             unreachable!("private backing access requires an owner-private allocation");
         };
         let token = MEMORY_THREAD_TOKEN.with(|token| *token);
-        if backing.data.owner() != token {
+        let owner = backing.data.owner();
+        if owner == OwnerPrivateSlot::RELEASED {
+            return Ok(self.with_released_private(operation));
+        }
+        if owner != token {
             return Err(MemoryError::OwnerPrivateAccessFromDifferentThread { allocation });
         }
         Self::with_private_data(backing, allocation, token, operation)
@@ -4019,6 +4064,42 @@ impl Allocation {
             }
         }
         Ok(operation(data))
+    }
+
+    /// Run `operation` on a discarded zero-filled copy of a released backing.
+    ///
+    /// A backing is released only when its owning warp has finished, and
+    /// nothing else can address a warp's LOCAL or REG bytes, so no later
+    /// access can observe what such an operation writes or reads. A late
+    /// write (for example an asynchronous completion into an exited warp's
+    /// registers) is accepted and dropped instead of turned into a new error.
+    #[cold]
+    fn with_released_private<R>(&self, operation: impl FnOnce(&mut OwnerPrivateData) -> R) -> R {
+        let mut scratch = InitialPrivateData::Filled {
+            byte_len: self.byte_len,
+            valid: false,
+        }
+        .materialize();
+        operation(&mut scratch)
+    }
+
+    /// Drop the private bytes of an allocation whose owner has finished with
+    /// it. The allocation itself (its id, length and views) stays, so
+    /// diagnostics that name it are unaffected.
+    fn release_private(&self) {
+        let AllocationBacking::OwnerPrivate(backing) = &self.backing else {
+            return;
+        };
+        let token = MEMORY_THREAD_TOKEN.with(|token| *token);
+        let released = backing
+            .data
+            .release(token, || lock_mutex(&backing.initial_data).take().is_some());
+        if released {
+            drop(std::mem::take(&mut *lock_mutex(&backing.pending_writes)));
+            backing
+                .pending_writes_present
+                .store(false, Ordering::Release);
+        }
     }
 
     fn enqueue_private_writes(
