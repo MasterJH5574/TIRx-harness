@@ -3114,18 +3114,23 @@ struct Allocation {
 enum LaunchBytes {
     /// The launch buffer itself, shared with the stripes that start from it.
     Retained(SharedInitialBytes),
-    /// All zero: an allocation created zero-filled, recorded by length so a
-    /// launch-lifetime copy of zeros is not kept for every warp or CTA.
-    Zeroed(usize),
+    /// All zero (the allocation's whole length): an allocation created
+    /// zero-filled, so a launch-lifetime copy of zeros is not kept for every
+    /// warp or CTA.
+    Zeroed,
 }
 
 /// The bytes a `LaunchBytes::Zeroed` answers with; `launch_word` reads at most
 /// eight of them.
 static LAUNCH_ZEROS: [u8; 16] = [0; 16];
 
+/// A launch has one owner-private allocation per LOCAL and REG backing of
+/// every warp (millions on unrolled kernels), against a handful of shared
+/// ones, so the owner-private record is kept inline and small and the shared
+/// one is boxed.
 enum AllocationBacking {
-    Shared(SharedAllocationBacking),
-    OwnerPrivate(Box<OwnerPrivateAllocationBacking>),
+    Shared(Box<SharedAllocationBacking>),
+    OwnerPrivate(OwnerPrivateAllocationBacking),
 }
 
 struct SharedAllocationBacking {
@@ -3135,10 +3140,28 @@ struct SharedAllocationBacking {
 
 struct OwnerPrivateAllocationBacking {
     data: OwnerPrivateSlot,
-    initial_data: Mutex<Option<InitialPrivateData>>,
-    pending_writes: Mutex<Vec<PendingPrivateWrite>>,
-    pending_writes_present: AtomicBool,
-    queue_cross_thread_writes: bool,
+    /// Writes other threads queued for the owner, in arenas that queue them
+    /// (`MemoryMode::QueuedOwnerPrivate`); `None` where such a write fails.
+    pending: Option<Box<PendingPrivateWrites>>,
+}
+
+impl OwnerPrivateAllocationBacking {
+    fn new(mode: MemoryMode, initial: InitialPrivateData) -> Self {
+        Self {
+            data: OwnerPrivateSlot::new(initial),
+            pending: (mode == MemoryMode::QueuedOwnerPrivate).then(|| {
+                Box::new(PendingPrivateWrites {
+                    writes: Mutex::new(Vec::new()),
+                    present: AtomicBool::new(false),
+                })
+            }),
+        }
+    }
+}
+
+struct PendingPrivateWrites {
+    writes: Mutex<Vec<PendingPrivateWrite>>,
+    present: AtomicBool,
 }
 
 /// Per-byte validity of an owner-private allocation, stored one bit per byte
@@ -3268,12 +3291,18 @@ struct OwnerPrivateData {
 /// This replaces a `ThreadLocal`, which allocated, for every allocation, a
 /// bucket of entries sized by the binding thread's index: one bucket per LOCAL
 /// and REG backing of every warp. The owner's token is published in `owner`,
-/// so a thread that is not the owner is turned away without touching the
-/// lock, exactly where a `ThreadLocal` lookup from another thread found no
-/// entry. Only the owner locks `data`, so the lock is never contended.
+/// so once the slot is bound a thread that is not the owner is turned away
+/// without touching the lock, exactly where a `ThreadLocal` lookup from
+/// another thread found no entry.
 struct OwnerPrivateSlot {
     owner: AtomicU64,
-    data: Mutex<Option<OwnerPrivateData>>,
+    state: Mutex<PrivateState>,
+}
+
+enum PrivateState {
+    Initial(InitialPrivateData),
+    Bound(OwnerPrivateData),
+    Released,
 }
 
 impl OwnerPrivateSlot {
@@ -3282,10 +3311,10 @@ impl OwnerPrivateSlot {
     /// The data was dropped by `release`; no thread's token.
     const RELEASED: u64 = u64::MAX;
 
-    fn new() -> Self {
+    fn new(initial: InitialPrivateData) -> Self {
         Self {
             owner: AtomicU64::new(Self::UNBOUND),
-            data: Mutex::new(None),
+            state: Mutex::new(PrivateState::Initial(initial)),
         }
     }
 
@@ -3294,42 +3323,41 @@ impl OwnerPrivateSlot {
         self.owner.load(Ordering::Acquire)
     }
 
-    /// Lock the owner's data. Only the owner calls this, so the lock is free
-    /// unless the owner re-enters, which a `RefCell` refused as well.
-    #[inline]
-    fn lock(&self) -> MutexGuard<'_, Option<OwnerPrivateData>> {
-        match self.data.try_lock() {
-            Ok(guard) => guard,
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => {
-                panic!("owner-private data is already borrowed by its owner")
-            }
-        }
-    }
-
-    /// Bind the calling thread (`token`) as owner with its initial data.
-    fn bind(&self, token: u64, data: OwnerPrivateData) {
-        *self.lock() = Some(data);
+    /// Bind the calling thread (`token`) as owner if no thread is bound.
+    /// Returns false if another thread took the initial data first.
+    fn bind(&self, token: u64) -> bool {
+        let mut state = lock_mutex(&self.state);
+        let PrivateState::Initial(_) = &*state else {
+            return false;
+        };
+        let PrivateState::Initial(initial) = std::mem::replace(&mut *state, PrivateState::Released)
+        else {
+            unreachable!("checked above");
+        };
+        let mut data = initial.materialize();
+        data.owner_thread = token;
+        *state = PrivateState::Bound(data);
         self.owner.store(token, Ordering::Release);
+        true
     }
 
-    /// Drop the owner's data. Only the owner (`token`) can release a bound
-    /// slot; `unbound_initial` drops the initial data of a slot no thread has
-    /// bound and says whether it did. Returns whether the slot is released.
-    fn release(&self, token: u64, unbound_initial: impl FnOnce() -> bool) -> bool {
+    /// Drop the data. Only the owner (`token`) can release a bound slot; a
+    /// slot no thread has bound is released by anyone. Returns whether the
+    /// slot is released now.
+    fn release(&self, token: u64) -> bool {
         let owner = self.owner();
-        if owner == token {
-            self.owner.store(Self::RELEASED, Ordering::Release);
-            drop(self.lock().take());
-            return true;
+        if owner != token && owner != Self::UNBOUND {
+            return false;
         }
-        if owner == Self::UNBOUND && unbound_initial() {
-            // `unbound_initial` took the only initial data, so no thread can
-            // bind this slot any more.
+        let mut state = lock_mutex(&self.state);
+        let owner = self.owner();
+        let releasable = owner == token
+            || owner == Self::UNBOUND && matches!(*state, PrivateState::Initial(_));
+        if releasable {
+            *state = PrivateState::Released;
             self.owner.store(Self::RELEASED, Ordering::Release);
-            return true;
         }
-        false
+        releasable
     }
 }
 
@@ -3856,27 +3884,24 @@ impl Allocation {
         let launch = SharedInitialBytes::new(bytes);
         let backing = match mode {
             MemoryMode::Shared => {
-                AllocationBacking::Shared(SharedAllocationBacking::new_with_initial_bytes(
+                AllocationBacking::Shared(Box::new(SharedAllocationBacking::new_with_initial_bytes(
                     launch.clone(),
                     Some(valid),
                     read_only,
-                ))
+                )))
             }
             MemoryMode::OwnerPrivate | MemoryMode::QueuedOwnerPrivate => {
                 debug_assert!(!read_only);
                 let invalid_byte_count = valid.iter().filter(|valid| !**valid).count();
-                AllocationBacking::OwnerPrivate(Box::new(OwnerPrivateAllocationBacking {
-                    data: OwnerPrivateSlot::new(),
-                    initial_data: Mutex::new(Some(InitialPrivateData::Data(OwnerPrivateData {
+                AllocationBacking::OwnerPrivate(OwnerPrivateAllocationBacking::new(
+                    mode,
+                    InitialPrivateData::Data(OwnerPrivateData {
                         owner_thread: 0,
                         bytes: launch.as_slice().to_vec(),
                         valid: PrivateValidity::from_bools(&valid),
                         invalid_byte_count,
-                    }))),
-                    pending_writes: Mutex::new(Vec::new()),
-                    pending_writes_present: AtomicBool::new(false),
-                    queue_cross_thread_writes: mode == MemoryMode::QueuedOwnerPrivate,
-                }))
+                    }),
+                ))
             }
         };
         Self {
@@ -3893,22 +3918,21 @@ impl Allocation {
         let launch = bytes.clone();
         let backing = match mode {
             MemoryMode::Shared => {
-                AllocationBacking::Shared(SharedAllocationBacking::new_all_valid(bytes, read_only))
+                AllocationBacking::Shared(Box::new(SharedAllocationBacking::new_all_valid(
+                    bytes, read_only,
+                )))
             }
             MemoryMode::OwnerPrivate | MemoryMode::QueuedOwnerPrivate => {
                 debug_assert!(!read_only);
-                AllocationBacking::OwnerPrivate(Box::new(OwnerPrivateAllocationBacking {
-                    data: OwnerPrivateSlot::new(),
-                    initial_data: Mutex::new(Some(InitialPrivateData::Data(OwnerPrivateData {
+                AllocationBacking::OwnerPrivate(OwnerPrivateAllocationBacking::new(
+                    mode,
+                    InitialPrivateData::Data(OwnerPrivateData {
                         owner_thread: 0,
                         bytes: bytes.as_slice().to_vec(),
                         valid: PrivateValidity::new_filled(byte_len, true),
                         invalid_byte_count: 0,
-                    }))),
-                    pending_writes: Mutex::new(Vec::new()),
-                    pending_writes_present: AtomicBool::new(false),
-                    queue_cross_thread_writes: mode == MemoryMode::QueuedOwnerPrivate,
-                }))
+                    }),
+                ))
             }
         };
         Self {
@@ -3926,16 +3950,13 @@ impl Allocation {
         debug_assert_ne!(mode, MemoryMode::Shared);
         Self {
             byte_len,
-            backing: AllocationBacking::OwnerPrivate(Box::new(OwnerPrivateAllocationBacking {
-                data: OwnerPrivateSlot::new(),
-                initial_data: Mutex::new(Some(InitialPrivateData::Filled { byte_len, valid })),
-                pending_writes: Mutex::new(Vec::new()),
-                pending_writes_present: AtomicBool::new(false),
-                queue_cross_thread_writes: mode == MemoryMode::QueuedOwnerPrivate,
-            })),
+            backing: AllocationBacking::OwnerPrivate(OwnerPrivateAllocationBacking::new(
+                mode,
+                InitialPrivateData::Filled { byte_len, valid },
+            )),
             write_through: false,
             observed_address: OnceLock::new(),
-            launch_bytes: Some(LaunchBytes::Zeroed(byte_len)),
+            launch_bytes: Some(LaunchBytes::Zeroed),
         }
     }
 
@@ -3945,7 +3966,9 @@ impl Allocation {
         let byte_len = bytes.byte_len();
         Self {
             byte_len,
-            backing: AllocationBacking::Shared(SharedAllocationBacking::new_host_all_valid(bytes)),
+            backing: AllocationBacking::Shared(Box::new(
+                SharedAllocationBacking::new_host_all_valid(bytes),
+            )),
             write_through: true,
             observed_address: OnceLock::new(),
             // A host region is mapped, not copied, so there is no launch
@@ -3960,8 +3983,8 @@ impl Allocation {
             LaunchBytes::Retained(bytes) => bytes
                 .as_slice()
                 .get(byte_offset..byte_offset.checked_add(byte_len)?),
-            LaunchBytes::Zeroed(len) => {
-                (byte_offset.checked_add(byte_len)? <= *len).then_some(())?;
+            LaunchBytes::Zeroed => {
+                (byte_offset.checked_add(byte_len)? <= self.byte_len).then_some(())?;
                 LAUNCH_ZEROS.get(..byte_len)
             }
         }
@@ -3973,7 +3996,7 @@ impl Allocation {
 
     fn shared(&self) -> Option<&SharedAllocationBacking> {
         match &self.backing {
-            AllocationBacking::Shared(backing) => Some(backing),
+            AllocationBacking::Shared(backing) => Some(&**backing),
             AllocationBacking::OwnerPrivate(_) => None,
         }
     }
@@ -4000,15 +4023,10 @@ impl Allocation {
         if owner == OwnerPrivateSlot::RELEASED {
             return Ok(self.with_released_private(operation));
         }
-        if owner != token {
-            // Unbound: the first thread to take the initial data owns it. A
-            // thread that finds it taken is not the owner.
-            let mut initial_data = lock_mutex(&backing.initial_data)
-                .take()
-                .ok_or(MemoryError::OwnerPrivateAccessFromDifferentThread { allocation })?
-                .materialize();
-            initial_data.owner_thread = token;
-            backing.data.bind(token, initial_data);
+        // Unbound: the first thread to take the initial data owns it. A
+        // thread that finds it taken is not the owner.
+        if owner != token && (owner != OwnerPrivateSlot::UNBOUND || !backing.data.bind(token)) {
+            return Err(MemoryError::OwnerPrivateAccessFromDifferentThread { allocation });
         }
         Self::with_private_data(backing, allocation, token, operation)
     }
@@ -4039,22 +4057,22 @@ impl Allocation {
         token: u64,
         operation: impl FnOnce(&mut OwnerPrivateData) -> R,
     ) -> Result<R, MemoryError> {
-        let mut guard = backing.data.lock();
-        let data = guard
-            .as_mut()
-            .expect("a bound owner-private slot holds its data");
+        let mut state = lock_mutex(&backing.data.state);
+        let PrivateState::Bound(data) = &mut *state else {
+            return Err(MemoryError::OwnerPrivateAccessFromDifferentThread { allocation });
+        };
         if data.owner_thread != token {
             return Err(MemoryError::OwnerPrivateAccessFromDifferentThread { allocation });
         }
-        if backing.queue_cross_thread_writes
-            && backing.pending_writes_present.load(Ordering::Acquire)
+        if let Some(queued) = backing
+            .pending
+            .as_ref()
+            .filter(|queued| queued.present.load(Ordering::Acquire))
         {
             let pending = {
-                let mut pending = lock_mutex(&backing.pending_writes);
+                let mut pending = lock_mutex(&queued.writes);
                 let pending = std::mem::take(&mut *pending);
-                backing
-                    .pending_writes_present
-                    .store(false, Ordering::Release);
+                queued.present.store(false, Ordering::Release);
                 pending
             };
             for write in pending {
@@ -4091,14 +4109,11 @@ impl Allocation {
             return;
         };
         let token = MEMORY_THREAD_TOKEN.with(|token| *token);
-        let released = backing
-            .data
-            .release(token, || lock_mutex(&backing.initial_data).take().is_some());
-        if released {
-            drop(std::mem::take(&mut *lock_mutex(&backing.pending_writes)));
-            backing
-                .pending_writes_present
-                .store(false, Ordering::Release);
+        if backing.data.release(token) {
+            if let Some(queued) = &backing.pending {
+                drop(std::mem::take(&mut *lock_mutex(&queued.writes)));
+                queued.present.store(false, Ordering::Release);
+            }
         }
     }
 
@@ -4110,14 +4125,12 @@ impl Allocation {
         let AllocationBacking::OwnerPrivate(backing) = &self.backing else {
             unreachable!("queued private writes require owner-private backing");
         };
-        if !backing.queue_cross_thread_writes {
+        let Some(queued) = &backing.pending else {
             return Err(MemoryError::OwnerPrivateAccessFromDifferentThread { allocation });
-        }
-        let mut pending = lock_mutex(&backing.pending_writes);
+        };
+        let mut pending = lock_mutex(&queued.writes);
         pending.extend(writes);
-        backing
-            .pending_writes_present
-            .store(true, Ordering::Release);
+        queued.present.store(true, Ordering::Release);
         Ok(())
     }
 }
