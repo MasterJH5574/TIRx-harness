@@ -1223,10 +1223,16 @@ impl GlobalMemory {
     }
 
     pub fn allocate_zeroed(&self, byte_len: usize) -> Result<AllocationId, MemoryError> {
+        if self.inner.mode != MemoryMode::Shared {
+            return self.allocate_owner_private_filled(byte_len, true);
+        }
         self.allocate(vec![0; byte_len], vec![true; byte_len], false)
     }
 
     pub fn allocate_uninitialized(&self, byte_len: usize) -> Result<AllocationId, MemoryError> {
+        if self.inner.mode != MemoryMode::Shared {
+            return self.allocate_owner_private_filled(byte_len, false);
+        }
         self.allocate(vec![0; byte_len], vec![false; byte_len], false)
     }
 
@@ -2963,6 +2969,33 @@ impl GlobalMemory {
         Ok(allocation)
     }
 
+    fn next_allocation_id(&self) -> Result<AllocationId, MemoryError> {
+        self.inner
+            .next_allocation_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                next.checked_add(1)
+            })
+            .map(AllocationId)
+            .map_err(|_| MemoryError::AllocationIdExhausted)
+    }
+
+    /// The owner-private form of `allocate(vec![0; n], vec![valid; n], false)`:
+    /// the same identity and contents, without materializing them up front.
+    fn allocate_owner_private_filled(
+        &self,
+        byte_len: usize,
+        valid: bool,
+    ) -> Result<AllocationId, MemoryError> {
+        let allocation = self.next_allocation_id()?;
+        let allocation_ref = Arc::new(Allocation::new_owner_private_filled(
+            self.inner.mode,
+            byte_len,
+            valid,
+        ));
+        self.insert_allocation(allocation, allocation_ref);
+        Ok(allocation)
+    }
+
     fn allocate_all_valid(
         &self,
         bytes: SharedInitialBytes,
@@ -3060,8 +3093,21 @@ struct Allocation {
     ///
     /// `None` where the launch bytes are a host region rather than an owned
     /// buffer; a caller that needs them must treat that as "unknown".
-    launch_bytes: Option<SharedInitialBytes>,
+    launch_bytes: Option<LaunchBytes>,
 }
+
+/// What an allocation held at launch.
+enum LaunchBytes {
+    /// The launch buffer itself, shared with the stripes that start from it.
+    Retained(SharedInitialBytes),
+    /// All zero: an allocation created zero-filled, recorded by length so a
+    /// launch-lifetime copy of zeros is not kept for every warp or CTA.
+    Zeroed(usize),
+}
+
+/// The bytes a `LaunchBytes::Zeroed` answers with; `launch_word` reads at most
+/// eight of them.
+static LAUNCH_ZEROS: [u8; 16] = [0; 16];
 
 enum AllocationBacking {
     Shared(SharedAllocationBacking),
@@ -3075,7 +3121,7 @@ struct SharedAllocationBacking {
 
 struct OwnerPrivateAllocationBacking {
     data: ThreadLocal<RefCell<OwnerPrivateData>>,
-    initial_data: Mutex<Option<OwnerPrivateData>>,
+    initial_data: Mutex<Option<InitialPrivateData>>,
     pending_writes: Mutex<Vec<PendingPrivateWrite>>,
     pending_writes_present: AtomicBool,
     queue_cross_thread_writes: bool,
@@ -3200,6 +3246,30 @@ struct OwnerPrivateData {
     bytes: Vec<u8>,
     valid: PrivateValidity,
     invalid_byte_count: usize,
+}
+
+/// The contents an owner-private allocation starts from, bound to its owner
+/// thread at first access.
+enum InitialPrivateData {
+    Data(OwnerPrivateData),
+    /// Zero bytes, all valid or all invalid. Materialized only when the owner
+    /// first touches the allocation, so warps and CTAs that have not started
+    /// (or never touch it) hold no backing.
+    Filled { byte_len: usize, valid: bool },
+}
+
+impl InitialPrivateData {
+    fn materialize(self) -> OwnerPrivateData {
+        match self {
+            Self::Data(data) => data,
+            Self::Filled { byte_len, valid } => OwnerPrivateData {
+                owner_thread: 0,
+                bytes: vec![0; byte_len],
+                valid: PrivateValidity::new_filled(byte_len, valid),
+                invalid_byte_count: if valid { 0 } else { byte_len },
+            },
+        }
+    }
 }
 
 struct PendingPrivateWrite {
@@ -3712,12 +3782,12 @@ impl Allocation {
                 let invalid_byte_count = valid.iter().filter(|valid| !**valid).count();
                 AllocationBacking::OwnerPrivate(Box::new(OwnerPrivateAllocationBacking {
                     data: ThreadLocal::new(),
-                    initial_data: Mutex::new(Some(OwnerPrivateData {
+                    initial_data: Mutex::new(Some(InitialPrivateData::Data(OwnerPrivateData {
                         owner_thread: 0,
                         bytes: launch.as_slice().to_vec(),
                         valid: PrivateValidity::from_bools(&valid),
                         invalid_byte_count,
-                    })),
+                    }))),
                     pending_writes: Mutex::new(Vec::new()),
                     pending_writes_present: AtomicBool::new(false),
                     queue_cross_thread_writes: mode == MemoryMode::QueuedOwnerPrivate,
@@ -3729,7 +3799,7 @@ impl Allocation {
             backing,
             write_through: false,
             observed_address: OnceLock::new(),
-            launch_bytes: Some(launch),
+            launch_bytes: Some(LaunchBytes::Retained(launch)),
         }
     }
 
@@ -3744,12 +3814,12 @@ impl Allocation {
                 debug_assert!(!read_only);
                 AllocationBacking::OwnerPrivate(Box::new(OwnerPrivateAllocationBacking {
                     data: ThreadLocal::new(),
-                    initial_data: Mutex::new(Some(OwnerPrivateData {
+                    initial_data: Mutex::new(Some(InitialPrivateData::Data(OwnerPrivateData {
                         owner_thread: 0,
                         bytes: bytes.as_slice().to_vec(),
                         valid: PrivateValidity::new_filled(byte_len, true),
                         invalid_byte_count: 0,
-                    })),
+                    }))),
                     pending_writes: Mutex::new(Vec::new()),
                     pending_writes_present: AtomicBool::new(false),
                     queue_cross_thread_writes: mode == MemoryMode::QueuedOwnerPrivate,
@@ -3761,7 +3831,26 @@ impl Allocation {
             backing,
             write_through: false,
             observed_address: OnceLock::new(),
-            launch_bytes: Some(launch),
+            launch_bytes: Some(LaunchBytes::Retained(launch)),
+        }
+    }
+
+    /// A zero-filled owner-private allocation whose backing is materialized
+    /// by its owner at first access (`InitialPrivateData::Filled`).
+    fn new_owner_private_filled(mode: MemoryMode, byte_len: usize, valid: bool) -> Self {
+        debug_assert_ne!(mode, MemoryMode::Shared);
+        Self {
+            byte_len,
+            backing: AllocationBacking::OwnerPrivate(Box::new(OwnerPrivateAllocationBacking {
+                data: ThreadLocal::new(),
+                initial_data: Mutex::new(Some(InitialPrivateData::Filled { byte_len, valid })),
+                pending_writes: Mutex::new(Vec::new()),
+                pending_writes_present: AtomicBool::new(false),
+                queue_cross_thread_writes: mode == MemoryMode::QueuedOwnerPrivate,
+            })),
+            write_through: false,
+            observed_address: OnceLock::new(),
+            launch_bytes: Some(LaunchBytes::Zeroed(byte_len)),
         }
     }
 
@@ -3782,8 +3871,15 @@ impl Allocation {
 
     /// The bytes this allocation was launched with, if they were retained.
     fn launch_bytes(&self, byte_offset: usize, byte_len: usize) -> Option<&[u8]> {
-        let bytes = self.launch_bytes.as_ref()?.as_slice();
-        bytes.get(byte_offset..byte_offset.checked_add(byte_len)?)
+        match self.launch_bytes.as_ref()? {
+            LaunchBytes::Retained(bytes) => bytes
+                .as_slice()
+                .get(byte_offset..byte_offset.checked_add(byte_len)?),
+            LaunchBytes::Zeroed(len) => {
+                (byte_offset.checked_add(byte_len)? <= *len).then_some(())?;
+                LAUNCH_ZEROS.get(..byte_len)
+            }
+        }
     }
 
     fn byte_len(&self) -> usize {
@@ -3818,7 +3914,8 @@ impl Allocation {
         let data = backing.data.get_or_try(|| {
             let mut initial_data = lock_mutex(&backing.initial_data)
                 .take()
-                .ok_or(MemoryError::OwnerPrivateAccessFromDifferentThread { allocation })?;
+                .ok_or(MemoryError::OwnerPrivateAccessFromDifferentThread { allocation })?
+                .materialize();
             initial_data.owner_thread = token;
             Ok(RefCell::new(initial_data))
         })?;
