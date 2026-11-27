@@ -4309,6 +4309,197 @@ impl ProtocolWordUse {
     }
 }
 
+type WordKey = (PhysicalAllocationId, usize);
+
+/// Every word's `ProtocolWordUse`, with the words only plain accesses have
+/// reached kept in a compact form.
+///
+/// Every global access that is not summarized away is recorded here, plain
+/// loads included, because a wait may declare the word later and must then
+/// judge the plain accesses that came first. A word that only plain accesses
+/// reached carries nothing but its first span and up to two bypass events,
+/// and a full `ProtocolWordUse` for each such word cost about 1 KB per
+/// element touched (19-25 GB on add_rmsnorm). Such words are kept as a
+/// `PlainWordUse` instead, with the operation interned, and promoted to the
+/// identical full record the moment anything else touches them.
+#[derive(Default)]
+struct ProtocolWords {
+    /// Words a strong access, a delivered read or a claim reached.
+    words: BTreeMap<WordKey, ProtocolWordUse>,
+    /// Words reached by plain accesses only, so far.
+    plain: BTreeMap<WordKey, PlainWordUse>,
+    plain_ops: PlainOperationTable,
+}
+
+/// What a `ProtocolWordUse` reached only by plain accesses holds: its first
+/// span and the first two distinct plain actors (`bypassing_ops`).
+#[derive(Clone, Copy, Debug)]
+struct PlainWordUse {
+    byte_len: u32,
+    first: PlainWordEvent,
+    second: Option<PlainWordEvent>,
+}
+
+/// A `BypassEvent` in 32 bytes: the operation is an index into
+/// `PlainOperationTable`, and a lane frontier is the owner's own lane.
+#[derive(Clone, Copy, Debug)]
+struct PlainWordEvent {
+    warp: u32,
+    lane: u8,
+    lease_generation: u32,
+    /// `NO_LEASE` for `WordFrontier::Lane(owner)`.
+    lease_index: u32,
+    epoch: u64,
+    operation: u32,
+}
+
+impl PlainWordEvent {
+    const NO_LEASE: u32 = u32::MAX;
+
+    fn owner(self) -> GlobalActor {
+        GlobalActor {
+            global_warp_id: self.warp as usize,
+            lane: self.lane,
+        }
+    }
+}
+
+/// Interned operations of plain word events, with the last one cached: the
+/// lanes of one batch arrive together and share it.
+#[derive(Default)]
+struct PlainOperationTable {
+    operations: Vec<DynamicOpId>,
+    index: HashMap<DynamicOpId, u32>,
+    last: Option<u32>,
+}
+
+impl PlainOperationTable {
+    fn intern(&mut self, operation: &DynamicOpId) -> Option<u32> {
+        if let Some(last) = self.last {
+            if self.operations[last as usize] == *operation {
+                return Some(last);
+            }
+        }
+        let id = match self.index.get(operation) {
+            Some(&id) => id,
+            None => {
+                let id = u32::try_from(self.operations.len()).ok()?;
+                self.operations.push(operation.clone());
+                self.index.insert(operation.clone(), id);
+                id
+            }
+        };
+        self.last = Some(id);
+        Some(id)
+    }
+
+    fn event(&self, event: PlainWordEvent) -> BypassEvent {
+        let owner = event.owner();
+        let frontier = if event.lease_index == PlainWordEvent::NO_LEASE {
+            WordFrontier::Lane(owner)
+        } else {
+            WordFrontier::Async(AsyncClockHandle {
+                index: event.lease_index as usize,
+                generation: event.lease_generation,
+            })
+        };
+        (
+            owner,
+            frontier,
+            event.epoch,
+            self.operations[event.operation as usize].clone(),
+        )
+    }
+}
+
+impl ProtocolWords {
+    /// The full record of `span`'s word, created (from its plain record, if
+    /// it has one) when missing.
+    fn entry(&mut self, span: PhysicalByteSpan) -> &mut ProtocolWordUse {
+        let key = (span.allocation(), span.byte_offset());
+        let Self {
+            words,
+            plain,
+            plain_ops,
+        } = self;
+        words.entry(key).or_insert_with(|| match plain.remove(&key) {
+            Some(record) => {
+                let mut full = ProtocolWordUse::default();
+                full.span = Some(
+                    PhysicalByteSpan::new(key.0, key.1, record.byte_len as usize)
+                        .expect("a recorded plain word span stays valid"),
+                );
+                full.bypassing_ops = [
+                    Some(plain_ops.event(record.first)),
+                    record.second.map(|event| plain_ops.event(event)),
+                ];
+                full
+            }
+            None => ProtocolWordUse::default(),
+        })
+    }
+
+    /// Record a plain access to a word that has no full record, exactly as
+    /// `record_protocol_word_use` would on a new or plain-only record.
+    /// Returns false, recording nothing, when the event does not fit the
+    /// compact form; the caller then records it on the full record.
+    fn note_plain(
+        &mut self,
+        span: PhysicalByteSpan,
+        owner: GlobalActor,
+        frontier: WordFrontier,
+        epoch: u64,
+        operation: &DynamicOpId,
+    ) -> bool {
+        let key = (span.allocation(), span.byte_offset());
+        if let Some(record) = self.plain.get(&key) {
+            let seen = |event: Option<PlainWordEvent>| event.is_some_and(|e| e.owner() == owner);
+            if seen(Some(record.first)) || seen(record.second) || record.second.is_some() {
+                // `note_bypass_event`: a known actor, or both slots taken.
+                return true;
+            }
+        }
+        let Ok(warp) = u32::try_from(owner.global_warp_id) else {
+            return false;
+        };
+        let (lease_index, lease_generation) = match frontier {
+            WordFrontier::Lane(lane_owner) if lane_owner == owner => (PlainWordEvent::NO_LEASE, 0),
+            WordFrontier::Lane(_) => return false,
+            WordFrontier::Async(handle) => match u32::try_from(handle.index) {
+                Ok(index) if index != PlainWordEvent::NO_LEASE => (index, handle.generation),
+                _ => return false,
+            },
+        };
+        let Some(operation) = self.plain_ops.intern(operation) else {
+            return false;
+        };
+        let event = PlainWordEvent {
+            warp,
+            lane: owner.lane,
+            lease_generation,
+            lease_index,
+            epoch,
+            operation,
+        };
+        if let Some(record) = self.plain.get_mut(&key) {
+            record.second = Some(event);
+            return true;
+        }
+        let Ok(byte_len) = u32::try_from(span.byte_len()) else {
+            return false;
+        };
+        self.plain.insert(
+            key,
+            PlainWordUse {
+                byte_len,
+                first: event,
+                second: None,
+            },
+        );
+        true
+    }
+}
+
 #[derive(Clone, Debug)]
 struct DeclaredWordWrite {
     value: u64,
@@ -5089,7 +5280,7 @@ pub(crate) struct GlobalRaceShared {
     /// primitive ever claimed it. A word two actors use this way, with at
     /// least one writing and no declaration anywhere, is a protocol the
     /// checker was never told the rules of.
-    protocol_word_use: Mutex<BTreeMap<(PhysicalAllocationId, usize), ProtocolWordUse>>,
+    protocol_word_use: Mutex<ProtocolWords>,
     /// Strong global writes whose width no wait can poll, by span.
     ///
     /// The post-image read-back only covers 4- and 8-byte writes, because those
@@ -5294,9 +5485,24 @@ impl GlobalRaceShared {
             .protocol_word_use
             .lock()
             .expect("global racecheck protocol-word lock was poisoned");
-        let entry = uses
-            .entry((span.allocation(), span.byte_offset()))
-            .or_default();
+        if let Some((record, _)) = plain {
+            if !writes
+                && !reads_only
+                && !uses
+                    .words
+                    .contains_key(&(span.allocation(), span.byte_offset()))
+                && uses.note_plain(
+                    span,
+                    record.actor(),
+                    record.frontier_key(),
+                    record.frontier_epoch,
+                    operation,
+                )
+            {
+                return;
+            }
+        }
+        let entry = uses.entry(span);
         entry.span.get_or_insert(span);
         // A publisher is spelled in raw PTX now -- `st.release`, `red`, `atom`
         // -- so reaching the word without the primitive is what a protocol
@@ -5367,9 +5573,7 @@ impl GlobalRaceShared {
             .protocol_word_use
             .lock()
             .expect("global racecheck protocol-word lock was poisoned");
-        let entry = uses
-            .entry((span.allocation(), span.byte_offset()))
-            .or_default();
+        let entry = uses.entry(span);
         entry.span.get_or_insert(span);
         entry.delivered_order = true;
     }
@@ -5402,7 +5606,8 @@ impl GlobalRaceShared {
                 .protocol_word_use
                 .lock()
                 .expect("global racecheck protocol-word lock was poisoned");
-            uses.values()
+            uses.words
+                .values()
                 .any(|use_| use_.declared && use_.span.is_some_and(|word| word.overlaps(span)))
         };
         if already_declared || dropped {
@@ -5442,9 +5647,7 @@ impl GlobalRaceShared {
             .protocol_word_use
             .lock()
             .expect("global racecheck protocol-word lock was poisoned");
-        let entry = uses
-            .entry((span.allocation(), span.byte_offset()))
-            .or_default();
+        let entry = uses.entry(span);
         entry.span.get_or_insert(span);
         // Asked the first time this word is claimed, not on every wait: the
         // question is about the word, and a spin claims it once per iteration.
@@ -5490,6 +5693,7 @@ impl GlobalRaceShared {
         self.protocol_word_use
             .lock()
             .expect("global racecheck protocol-word lock was poisoned")
+            .words
             .iter()
             .filter_map(|(_key, use_)| use_.bypass.clone())
             .collect()
@@ -5500,6 +5704,7 @@ impl GlobalRaceShared {
         self.protocol_word_use
             .lock()
             .expect("global racecheck protocol-word lock was poisoned")
+            .words
             .iter()
             .filter_map(|(_key, use_)| {
                 if use_.declared || !use_.delivered_order {
