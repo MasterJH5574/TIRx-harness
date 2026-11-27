@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
@@ -9,7 +8,6 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 use std::task::{Context, Poll, Waker};
-use thread_local::ThreadLocal;
 
 #[cfg(feature = "python")]
 use numsim_host_buffer::{HostByteBuffer, HostByteRegion};
@@ -3120,7 +3118,7 @@ struct SharedAllocationBacking {
 }
 
 struct OwnerPrivateAllocationBacking {
-    data: ThreadLocal<RefCell<OwnerPrivateData>>,
+    data: OwnerPrivateSlot,
     initial_data: Mutex<Option<InitialPrivateData>>,
     pending_writes: Mutex<Vec<PendingPrivateWrite>>,
     pending_writes_present: AtomicBool,
@@ -3246,6 +3244,56 @@ struct OwnerPrivateData {
     bytes: Vec<u8>,
     valid: PrivateValidity,
     invalid_byte_count: usize,
+}
+
+/// The data of one owner-private allocation, bound to the first thread that
+/// takes its initial data.
+///
+/// This replaces a `ThreadLocal`, which allocated, for every allocation, a
+/// bucket of entries sized by the binding thread's index: one bucket per LOCAL
+/// and REG backing of every warp. The owner's token is published in `owner`,
+/// so a thread that is not the owner is turned away without touching the
+/// lock, exactly where a `ThreadLocal` lookup from another thread found no
+/// entry. Only the owner locks `data`, so the lock is never contended.
+struct OwnerPrivateSlot {
+    owner: AtomicU64,
+    data: Mutex<Option<OwnerPrivateData>>,
+}
+
+impl OwnerPrivateSlot {
+    /// Memory thread tokens start at 1, so 0 is never a thread's.
+    const UNBOUND: u64 = 0;
+
+    fn new() -> Self {
+        Self {
+            owner: AtomicU64::new(Self::UNBOUND),
+            data: Mutex::new(None),
+        }
+    }
+
+    #[inline]
+    fn owner(&self) -> u64 {
+        self.owner.load(Ordering::Acquire)
+    }
+
+    /// Lock the owner's data. Only the owner calls this, so the lock is free
+    /// unless the owner re-enters, which a `RefCell` refused as well.
+    #[inline]
+    fn lock(&self) -> MutexGuard<'_, Option<OwnerPrivateData>> {
+        match self.data.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                panic!("owner-private data is already borrowed by its owner")
+            }
+        }
+    }
+
+    /// Bind the calling thread (`token`) as owner with its initial data.
+    fn bind(&self, token: u64, data: OwnerPrivateData) {
+        *self.lock() = Some(data);
+        self.owner.store(token, Ordering::Release);
+    }
 }
 
 /// The contents an owner-private allocation starts from, bound to its owner
@@ -3781,7 +3829,7 @@ impl Allocation {
                 debug_assert!(!read_only);
                 let invalid_byte_count = valid.iter().filter(|valid| !**valid).count();
                 AllocationBacking::OwnerPrivate(Box::new(OwnerPrivateAllocationBacking {
-                    data: ThreadLocal::new(),
+                    data: OwnerPrivateSlot::new(),
                     initial_data: Mutex::new(Some(InitialPrivateData::Data(OwnerPrivateData {
                         owner_thread: 0,
                         bytes: launch.as_slice().to_vec(),
@@ -3813,7 +3861,7 @@ impl Allocation {
             MemoryMode::OwnerPrivate | MemoryMode::QueuedOwnerPrivate => {
                 debug_assert!(!read_only);
                 AllocationBacking::OwnerPrivate(Box::new(OwnerPrivateAllocationBacking {
-                    data: ThreadLocal::new(),
+                    data: OwnerPrivateSlot::new(),
                     initial_data: Mutex::new(Some(InitialPrivateData::Data(OwnerPrivateData {
                         owner_thread: 0,
                         bytes: bytes.as_slice().to_vec(),
@@ -3842,7 +3890,7 @@ impl Allocation {
         Self {
             byte_len,
             backing: AllocationBacking::OwnerPrivate(Box::new(OwnerPrivateAllocationBacking {
-                data: ThreadLocal::new(),
+                data: OwnerPrivateSlot::new(),
                 initial_data: Mutex::new(Some(InitialPrivateData::Filled { byte_len, valid })),
                 pending_writes: Mutex::new(Vec::new()),
                 pending_writes_present: AtomicBool::new(false),
@@ -3911,15 +3959,17 @@ impl Allocation {
             unreachable!("private backing access requires an owner-private allocation");
         };
         let token = MEMORY_THREAD_TOKEN.with(|token| *token);
-        let data = backing.data.get_or_try(|| {
+        if backing.data.owner() != token {
+            // Unbound: the first thread to take the initial data owns it. A
+            // thread that finds it taken is not the owner.
             let mut initial_data = lock_mutex(&backing.initial_data)
                 .take()
                 .ok_or(MemoryError::OwnerPrivateAccessFromDifferentThread { allocation })?
                 .materialize();
             initial_data.owner_thread = token;
-            Ok(RefCell::new(initial_data))
-        })?;
-        Self::with_private_data(backing, allocation, token, data, operation)
+            backing.data.bind(token, initial_data);
+        }
+        Self::with_private_data(backing, allocation, token, operation)
     }
 
     fn with_private_if_bound<R>(
@@ -3931,11 +3981,10 @@ impl Allocation {
             unreachable!("private backing access requires an owner-private allocation");
         };
         let token = MEMORY_THREAD_TOKEN.with(|token| *token);
-        let data = backing
-            .data
-            .get()
-            .ok_or(MemoryError::OwnerPrivateAccessFromDifferentThread { allocation })?;
-        Self::with_private_data(backing, allocation, token, data, operation)
+        if backing.data.owner() != token {
+            return Err(MemoryError::OwnerPrivateAccessFromDifferentThread { allocation });
+        }
+        Self::with_private_data(backing, allocation, token, operation)
     }
 
     #[inline]
@@ -3943,10 +3992,12 @@ impl Allocation {
         backing: &OwnerPrivateAllocationBacking,
         allocation: AllocationId,
         token: u64,
-        data: &RefCell<OwnerPrivateData>,
         operation: impl FnOnce(&mut OwnerPrivateData) -> R,
     ) -> Result<R, MemoryError> {
-        let mut data = data.borrow_mut();
+        let mut guard = backing.data.lock();
+        let data = guard
+            .as_mut()
+            .expect("a bound owner-private slot holds its data");
         if data.owner_thread != token {
             return Err(MemoryError::OwnerPrivateAccessFromDifferentThread { allocation });
         }
@@ -3964,10 +4015,10 @@ impl Allocation {
             for write in pending {
                 let bytes = &write.bytes;
                 data.bytes[write.absolute..write.absolute + bytes.len()].copy_from_slice(bytes);
-                mark_private_initialized(&mut data, write.absolute, bytes.len());
+                mark_private_initialized(data, write.absolute, bytes.len());
             }
         }
-        Ok(operation(&mut data))
+        Ok(operation(data))
     }
 
     fn enqueue_private_writes(
