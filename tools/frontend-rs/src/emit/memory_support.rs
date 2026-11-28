@@ -11,7 +11,7 @@ use super::super::analyze::buffers::call_op_name;
 use super::super::analyze::memory::MemorySpace;
 use super::super::analyze::util::{
     as_buffer, as_var, buffer_dtype, buffer_scope, dtype_of, int_imm_expr, oref, prim, repr_text,
-    simplify, unsupported, AResult,
+    same, simplify, unsupported, AResult,
 };
 use super::abi;
 use super::{ControlProvenance, Emitter, RustValue, Uniformity};
@@ -320,11 +320,14 @@ impl<'a> Emitter<'a> {
     }
 
     /// The pointer of an exact `address_of(G[indices])` on a global tensor
-    /// `G`, addressed by a global or generic access, keeps `G` as its
-    /// allocation: the access is checked against `G` itself, as CUDA
+    /// parameter `G`, addressed by a global or generic access, keeps `G` as
+    /// its allocation: the access is checked against `G` itself, as CUDA
     /// dereferences `&G[indices]`. The same element through its integer
     /// generic address resolves to whichever allocation owns those bits, and
     /// to no binding at all (an incomplete analysis) once it leaves `G`.
+    /// Only parameters qualify: a declared view of an allocation may be
+    /// indexed past its own extent while staying inside the allocation, and
+    /// its integer address resolves that correctly.
     fn global_address_of_pointer(
         &mut self,
         address: &ObjectRef,
@@ -346,7 +349,9 @@ impl<'a> Emitter<'a> {
         let Some(source) = as_buffer(&oref(load.source.clone())) else {
             return Ok(None);
         };
-        if buffer_scope(&source) != "global" {
+        if buffer_scope(&source) != "global"
+            || !self.params.iter().any(|parameter| same(parameter, &source))
+        {
             return Ok(None);
         }
         // Lower the call as before, for its bookkeeping; only its integer
